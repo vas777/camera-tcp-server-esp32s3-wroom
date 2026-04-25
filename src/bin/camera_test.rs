@@ -1,0 +1,557 @@
+//! Drives the camera on a Freenove ESP32-S3 WROOM (also works as is on the
+//! ESP32S3-EYE)
+//!
+//! This example reads a JPEG from an OV3660 and writes it to the console as
+//! hex.
+//!
+//! The following wiring is assumed:
+//! - SIOD  => GPIO4
+//! - SIOC  => GPIO5
+//! - XCLK  => GPIO15
+//! - VSYNC => GPIO6
+//! - HREF  => GPIO7
+//! - PCLK  => GPIO13
+//! - D2    => GPIO11
+//! - D3    => GPIO9
+//! - D4    => GPIO8
+//! - D5    => GPIO10
+//! - D6    => GPIO12
+//! - D7    => GPIO18
+//! - D8    => GPIO17
+//! - D9    => GPIO16
+
+//% CHIPS: esp32s3
+
+// https://github.com/esp-rs/esp-hal/blob/main/qa-test/src/bin/lcd_cam_ov2640.rs
+// https://github.com/espressif/esp32-camera/blob/master/sensors/ov3660.c#L999
+
+#![no_std]
+#![no_main]
+
+use esp_backtrace as _;
+use esp_hal::{
+    Blocking,
+    delay::Delay,
+    dma_rx_stream_buffer,
+    i2c::{
+        self,
+        master::{Config, I2c},
+    },
+    lcd_cam::{
+        LcdCam,
+        cam::{self, Camera},
+    },
+    main,
+    time::Rate,
+};
+use esp_println::{print, println};
+
+esp_bootloader_esp_idf::esp_app_desc!();
+
+#[main]
+fn main() -> ! {
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    let dma_rx_buf = dma_rx_stream_buffer!(160 * 1000);
+
+    let cam_siod = peripherals.GPIO4;
+    let cam_sioc = peripherals.GPIO5;
+    let cam_xclk = peripherals.GPIO15;
+    let cam_vsync = peripherals.GPIO6;
+    let cam_href = peripherals.GPIO7;
+    let cam_pclk = peripherals.GPIO13;
+
+    let cam_config = cam::Config::default().with_frequency(Rate::from_mhz(10));
+
+    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
+    let camera = Camera::new(lcd_cam.cam, peripherals.DMA_CH0, cam_config)
+        .unwrap()
+        .with_master_clock(cam_xclk)
+        .with_pixel_clock(cam_pclk)
+        .with_vsync(cam_vsync)
+        .with_h_enable(cam_href)
+        .with_data0(peripherals.GPIO11)
+        .with_data1(peripherals.GPIO9)
+        .with_data2(peripherals.GPIO8)
+        .with_data3(peripherals.GPIO10)
+        .with_data4(peripherals.GPIO12)
+        .with_data5(peripherals.GPIO18)
+        .with_data6(peripherals.GPIO17)
+        .with_data7(peripherals.GPIO16);
+
+    let delay = Delay::new();
+
+    delay.delay_millis(500u32);
+
+    let i2c = I2c::new(peripherals.I2C0, Config::default())
+        .unwrap()
+        .with_sda(cam_siod)
+        .with_scl(cam_sioc);
+
+    let mut sccb = Sccb::new(i2c);
+
+    // Checking camera slv_address
+    sccb.probe(OV3660_ADDRESS).unwrap();
+    println!("Probe successful!");
+
+    let pid = sccb.read(OV3660_ADDRESS, &[0x30, 0x0A]).unwrap();
+    if pid != 0x36 {
+        panic!("Found PID of {:#02X}, and was expecting 0x36", pid);
+    }
+
+    let pid = sccb.read(OV3660_ADDRESS, &[0x30, 0x0B]).unwrap();
+    if pid != 0x60 {
+        panic!("Found PID of {:#02X}, and was expecting 0x60", pid);
+    }
+
+    for (reg, value) in RESET_BLOCK {
+        sccb.write(
+            OV3660_ADDRESS,
+            &[(reg >> 8) as u8, (reg & 0xff) as u8],
+            *value,
+        )
+        .unwrap();
+    }
+
+    delay.delay_millis(20u32);
+
+    for (reg, value) in SECOND_BLOCK {
+        sccb.write(
+            OV3660_ADDRESS,
+            &[(reg >> 8) as u8, (reg & 0xff) as u8],
+            *value,
+        )
+        .unwrap();
+    }
+
+    for (reg, value) in SENSOR_FMT_JPEG {
+        sccb.write(
+            OV3660_ADDRESS,
+            &[(reg >> 8) as u8, (reg & 0xff) as u8],
+            *value,
+        )
+        .unwrap();
+    }
+
+    for (reg, value) in SENSOR_FRAMESIZE_SVGA {
+        sccb.write(
+            OV3660_ADDRESS,
+            &[(reg >> 8) as u8, (reg & 0xff) as u8],
+            *value,
+        )
+        .unwrap();
+    }
+
+    delay.delay_millis(200u32);
+
+    // Start receiving data from the camera.
+    let mut transfer = camera.receive(dma_rx_buf).map_err(|e| e.0).unwrap();
+
+    // Skip the first 2 images. Each image ends with an EOF.
+    // We likely missed the first few bytes of the first image and the second image
+    // is likely garbage from the OV3660 focusing, calibrating, etc.
+    // Feel free to skip more images if the one captured below is still garbage.
+    for _ in 0..2 {
+        let mut total_bytes = 0;
+        loop {
+            let (data, ends_with_eof) = transfer.peek_until_eof();
+            if data.is_empty() {
+                if transfer.is_done() {
+                    panic!("We were too slow to read from the DMA");
+                }
+            } else {
+                let bytes_peeked = data.len();
+                transfer.consume(bytes_peeked);
+                total_bytes += bytes_peeked;
+                if ends_with_eof {
+                    // Found the end of the image/frame.
+                    println!("Skipped a {} byte image", total_bytes);
+                    break;
+                }
+            }
+        }
+    }
+
+    println!("Frame data (parse with `xxd -r -p <uart>.txt image.jpg`):");
+
+    // Note: JPEGs starts with "FF, D8, FF, E0" and end with "FF, D9".
+    // The OV3660 also sends some trailing zeros after the JPEG. This is expected.
+    loop {
+        let (data, ends_with_eof) = transfer.peek_until_eof();
+        if data.is_empty() {
+            if transfer.is_done() {
+                panic!("We were too slow to read from the DMA");
+            }
+        } else {
+            for b in data {
+                print!("{:02X}, ", b);
+            }
+            let bytes_peeked = data.len();
+            transfer.consume(bytes_peeked);
+
+            if ends_with_eof {
+                // Found the end of the image/frame.
+                println!("ends_with_eof");
+                break;
+            }
+        }
+    }
+
+    // The full frame has been captured, the transfer can be stopped now.
+    let _ = transfer.stop();
+
+    loop {}
+}
+
+pub const OV3660_ADDRESS: u8 = 0x3c;
+
+pub struct Sccb<'d> {
+    i2c: I2c<'d, Blocking>,
+}
+
+impl<'d> Sccb<'d> {
+    pub fn new(i2c: I2c<'d, Blocking>) -> Self {
+        Self { i2c }
+    }
+
+    pub fn probe(&mut self, slv_address: u8) -> Result<(), i2c::master::Error> {
+        self.i2c.write(slv_address, &[])
+    }
+
+    pub fn read(&mut self, slv_address: u8, reg: &[u8]) -> Result<u8, i2c::master::Error> {
+        self.i2c.write(slv_address, reg)?;
+
+        let mut bytes = [0u8; 1];
+        self.i2c.read(slv_address, &mut bytes)?;
+        Ok(bytes[0])
+    }
+
+    pub fn write(
+        &mut self,
+        slv_address: u8,
+        reg: &[u8],
+        data: u8,
+    ) -> Result<(), i2c::master::Error> {
+        self.i2c.write(slv_address, &[reg[0], reg[1], data])
+    }
+}
+
+const SYSTEM_CTROL0: u16 = 0x3008;
+const REG_DLY: u16 = 0xffff;
+const DRIVE_CAPABILITY: u16 = 0x302c;
+const CLOCK_POL_CONTROL: u16 = 0x4740;
+const COMPRESSION_CTRL0E: u16 = 0x440e;
+const ISP_CONTROL_01: u16 = 0x5001;
+const REGLIST_TAIL: u16 = 0x0000;
+const FORMAT_CTRL: u16 = 0x501F;
+const FORMAT_CTRL00: u16 = 0x4300;
+
+const RESET_BLOCK: &[(u16, u8)] = &[(0x3008, 0x80)];
+
+const SENSOR_FMT_JPEG: &[(u16, u8)] = &[
+    (FORMAT_CTRL, 0x00),   // YUV422
+    (FORMAT_CTRL00, 0x30), // YUYV
+    (0x3002, 0x00),        //0x1c to 0x00 !!!
+    (0x3006, 0xff),        //0xc3 to 0xff !!!
+    (0x471c, 0x50),        //0xd0 to 0x50 !!!
+    (0x3821, 0x20),        // compression for jpeg
+    (REGLIST_TAIL, 0x00),  // tail
+];
+
+const SENSOR_FRAMESIZE_SVGA: &[(u16, u8)] = &[
+    // 1. Image Bounding Box (4:3 ratio full sensor: 0,0 to 2047,1535)
+    (0x3800, 0x00),
+    (0x3801, 0x00), // X_ADDR_ST (0)
+    (0x3802, 0x00),
+    (0x3803, 0x00), // Y_ADDR_ST (0)
+    (0x3804, 0x07),
+    (0x3805, 0xFF), // X_ADDR_END (2047)
+    (0x3806, 0x05),
+    (0x3807, 0xFF), // Y_ADDR_END (1535)
+    // 2. Output Size (800 x 600)
+    (0x3808, 0x03),
+    (0x3809, 0x20), // X_OUTPUT_SIZE (800)
+    (0x380a, 0x02),
+    (0x380b, 0x58), // Y_OUTPUT_SIZE (600)
+    // 3. Total Size and ISP Offsets (with Binning enabled)
+    (0x380c, 0x08),
+    (0x380d, 0xC0), // X_TOTAL_SIZE (2240)
+    (0x380e, 0x03),
+    (0x380f, 0x0D), // Y_TOTAL_SIZE (781)
+    (0x3810, 0x00),
+    (0x3811, 0x08), // X_OFFSET (8)
+    (0x3812, 0x00),
+    (0x3813, 0x02), // Y_OFFSET (2)
+    // 4. Subsample Increments (Binning Odd:3, Even:1)
+    (0x3814, 0x31), // X_INCREMENT
+    (0x3815, 0x31), // Y_INCREMENT
+    // 5. Enable Scaling and Binning aligners
+    (0x5001, 0xA3), // ISP_CONTROL_01 (Scale Enable)
+    (0x4514, 0xAA), // Binning alignment
+    (0x4520, 0x0B), // Binning format
+    // 6. Timing and JPEG Compression Enable
+    (0x3820, 0x01), // Vertical binning enable
+    (0x3821, 0x21), // Compression enable (Bit 5) & Horizontal binning (Bit 0)
+    // 7. JPEG Compression Quality (QS)
+    // Lower value = Better quality / Larger file size. (Valid range roughly 0x04 to 0x3F)
+    // 0x04 = Excellent, 0x08 = Good/Standard, 0x10+ = Poor
+    (0x4407, 0x01),
+];
+
+// TODO: does not work
+// const SENSOR_FRAMESIZE_QXGA: &[(u16, u8)] = &[
+
+//     (0x303a, 0x00), (0x303b, 0x18), (0x303c, 0x11), (0x303d, 0x30), (0x3824, 0x08), (0x460C, 0x22),
+
+//     // 1. Image Bounding Box (4:3 ratio full sensor: 0,0 to 2047,1535)
+//     (0x3800, 0x00), (0x3801, 0x00), // X_ADDR_ST (0)
+//     (0x3802, 0x00), (0x3803, 0x00), // Y_ADDR_ST (0)
+//     (0x3804, 0x07), (0x3805, 0xFF), // X_ADDR_END (2047)
+//     (0x3806, 0x05), (0x3807, 0xFF), // Y_ADDR_END (1535)
+
+//     // 2. Output Size (2048 x 1536)
+//     (0x3808, 0x08), (0x3809, 0x00), // X_OUTPUT_SIZE (2048)
+//     (0x380a, 0x06), (0x380b, 0x00), // Y_OUTPUT_SIZE (1536)
+
+//     // 3. Total Size and ISP Offsets (No Binning)
+//     (0x380c, 0x08), (0x380d, 0xC0), // X_TOTAL_SIZE (2240)
+//     (0x380e, 0x06), (0x380f, 0x4C), // Y_TOTAL_SIZE (1612)
+//     (0x3810, 0x00), (0x3811, 0x10), // X_OFFSET (16)
+//     (0x3812, 0x00), (0x3813, 0x06), // Y_OFFSET (6)
+
+//     // 4. Subsample Increments (No Binning: Odd 1, Even 1)
+//     (0x3814, 0x11), // X_INCREMENT
+//     (0x3815, 0x11), // Y_INCREMENT
+
+//     // 5. Disable Scaling and Binning aligners
+//     (0x5001, 0x83), // ISP_CONTROL_01 (Scale Disable)
+//     (0x4514, 0x88), // Normal alignment (No binning)
+//     (0x4520, 0xB0), // Normal format (No binning)
+
+//     // 6. Timing and JPEG Compression Enable
+//     (0x3820, 0x40), // Vertical normal (No binning, bit 6=1)
+//     (0x3821, 0x20), // Compression enable (Bit 5), No horizontal binning
+
+//     // 7. JPEG Compression Quality (QS)
+//     // Start at 0x08 to avoid immediate DMA overflow, then adjust downwards.
+//     (0x4407, 0x08),
+// ];
+
+// init defaults
+const SECOND_BLOCK: &[(u16, u8)] = &[
+    (SYSTEM_CTROL0, 0x82), // software reset
+    (REG_DLY, 10),         // delay 10ms
+    (0x3103, 0x13),
+    (SYSTEM_CTROL0, 0x42),
+    (0x3017, 0xff),
+    (0x3018, 0xff),
+    (DRIVE_CAPABILITY, 0xc3),
+    (CLOCK_POL_CONTROL, 0x21),
+    (0x3611, 0x01),
+    (0x3612, 0x2d),
+    (0x3032, 0x00),
+    (0x3614, 0x80),
+    (0x3618, 0x00),
+    (0x3619, 0x75),
+    (0x3622, 0x80),
+    (0x3623, 0x00),
+    (0x3624, 0x03),
+    (0x3630, 0x52),
+    (0x3632, 0x07),
+    (0x3633, 0xd2),
+    (0x3704, 0x80),
+    (0x3708, 0x66),
+    (0x3709, 0x12),
+    (0x370b, 0x12),
+    (0x3717, 0x00),
+    (0x371b, 0x60),
+    (0x371c, 0x00),
+    (0x3901, 0x13),
+    (0x3600, 0x08),
+    (0x3620, 0x43),
+    (0x3702, 0x20),
+    (0x3739, 0x48),
+    (0x3730, 0x20),
+    (0x370c, 0x0c),
+    (0x3a18, 0x00),
+    (0x3a19, 0xf8),
+    (0x3000, 0x10),
+    (0x3004, 0xef),
+    (0x6700, 0x05),
+    (0x6701, 0x19),
+    (0x6702, 0xfd),
+    (0x6703, 0xd1),
+    (0x6704, 0xff),
+    (0x6705, 0xff),
+    (0x3c01, 0x80),
+    (0x3c00, 0x04),
+    (0x3a08, 0x00),
+    (0x3a09, 0x62), //50Hz Band Width Step (10bit)
+    (0x3a0e, 0x08), //50Hz Max Bands in One Frame (6 bit)
+    (0x3a0a, 0x00),
+    (0x3a0b, 0x52), //60Hz Band Width Step (10bit)
+    (0x3a0d, 0x09), //60Hz Max Bands in One Frame (6 bit)
+    (0x3a00, 0x3a), //night mode off
+    (0x3a14, 0x09),
+    (0x3a15, 0x30),
+    (0x3a02, 0x09),
+    (0x3a03, 0x30),
+    (COMPRESSION_CTRL0E, 0x08),
+    (0x4520, 0x0b),
+    (0x460b, 0x37),
+    (0x4713, 0x02),
+    (0x471c, 0xd0),
+    (0x5086, 0x00),
+    (0x5002, 0x00),
+    (0x501f, 0x00),
+    (SYSTEM_CTROL0, 0x02),
+    (0x5180, 0xff),
+    (0x5181, 0xf2),
+    (0x5182, 0x00),
+    (0x5183, 0x14),
+    (0x5184, 0x25),
+    (0x5185, 0x24),
+    (0x5186, 0x16),
+    (0x5187, 0x16),
+    (0x5188, 0x16),
+    (0x5189, 0x68),
+    (0x518a, 0x60),
+    (0x518b, 0xe0),
+    (0x518c, 0xb2),
+    (0x518d, 0x42),
+    (0x518e, 0x35),
+    (0x518f, 0x56),
+    (0x5190, 0x56),
+    (0x5191, 0xf8),
+    (0x5192, 0x04),
+    (0x5193, 0x70),
+    (0x5194, 0xf0),
+    (0x5195, 0xf0),
+    (0x5196, 0x03),
+    (0x5197, 0x01),
+    (0x5198, 0x04),
+    (0x5199, 0x12),
+    (0x519a, 0x04),
+    (0x519b, 0x00),
+    (0x519c, 0x06),
+    (0x519d, 0x82),
+    (0x519e, 0x38),
+    (0x5381, 0x1d),
+    (0x5382, 0x60),
+    (0x5383, 0x03),
+    (0x5384, 0x0c),
+    (0x5385, 0x78),
+    (0x5386, 0x84),
+    (0x5387, 0x7d),
+    (0x5388, 0x6b),
+    (0x5389, 0x12),
+    (0x538a, 0x01),
+    (0x538b, 0x98),
+    (0x5480, 0x01),
+    //    (0x5481, 0x05),
+    //    (0x5482, 0x09),
+    //    (0x5483, 0x10),
+    //    (0x5484, 0x3a),
+    //    (0x5485, 0x4c),
+    //    (0x5486, 0x5a),
+    //    (0x5487, 0x68),
+    //    (0x5488, 0x74),
+    //    (0x5489, 0x80),
+    //    (0x548a, 0x8e),
+    //    (0x548b, 0xa4),
+    //    (0x548c, 0xb4),
+    //    (0x548d, 0xc8),
+    //    (0x548e, 0xde),
+    //    (0x548f, 0xf0),
+    //    (0x5490, 0x15),
+    (0x5000, 0xa7),
+    (0x5800, 0x0C),
+    (0x5801, 0x09),
+    (0x5802, 0x0C),
+    (0x5803, 0x0C),
+    (0x5804, 0x0D),
+    (0x5805, 0x17),
+    (0x5806, 0x06),
+    (0x5807, 0x05),
+    (0x5808, 0x04),
+    (0x5809, 0x06),
+    (0x580a, 0x09),
+    (0x580b, 0x0E),
+    (0x580c, 0x05),
+    (0x580d, 0x01),
+    (0x580e, 0x01),
+    (0x580f, 0x01),
+    (0x5810, 0x05),
+    (0x5811, 0x0D),
+    (0x5812, 0x05),
+    (0x5813, 0x01),
+    (0x5814, 0x01),
+    (0x5815, 0x01),
+    (0x5816, 0x05),
+    (0x5817, 0x0D),
+    (0x5818, 0x08),
+    (0x5819, 0x06),
+    (0x581a, 0x05),
+    (0x581b, 0x07),
+    (0x581c, 0x0B),
+    (0x581d, 0x0D),
+    (0x581e, 0x12),
+    (0x581f, 0x0D),
+    (0x5820, 0x0E),
+    (0x5821, 0x10),
+    (0x5822, 0x10),
+    (0x5823, 0x1E),
+    (0x5824, 0x53),
+    (0x5825, 0x15),
+    (0x5826, 0x05),
+    (0x5827, 0x14),
+    (0x5828, 0x54),
+    (0x5829, 0x25),
+    (0x582a, 0x33),
+    (0x582b, 0x33),
+    (0x582c, 0x34),
+    (0x582d, 0x16),
+    (0x582e, 0x24),
+    (0x582f, 0x41),
+    (0x5830, 0x50),
+    (0x5831, 0x42),
+    (0x5832, 0x15),
+    (0x5833, 0x25),
+    (0x5834, 0x34),
+    (0x5835, 0x33),
+    (0x5836, 0x24),
+    (0x5837, 0x26),
+    (0x5838, 0x54),
+    (0x5839, 0x25),
+    (0x583a, 0x15),
+    (0x583b, 0x25),
+    (0x583c, 0x53),
+    (0x583d, 0xCF),
+    (0x3a0f, 0x30),
+    (0x3a10, 0x28),
+    (0x3a1b, 0x30),
+    (0x3a1e, 0x28),
+    (0x3a11, 0x60),
+    (0x3a1f, 0x14),
+    (0x5302, 0x28),
+    (0x5303, 0x20),
+    (0x5306, 0x1c), //de-noise offset 1
+    (0x5307, 0x28), //de-noise offset 2
+    (0x4002, 0xc5),
+    (0x4003, 0x81),
+    (0x4005, 0x12),
+    (0x5688, 0x11),
+    (0x5689, 0x11),
+    (0x568a, 0x11),
+    (0x568b, 0x11),
+    (0x568c, 0x11),
+    (0x568d, 0x11),
+    (0x568e, 0x11),
+    (0x568f, 0x11),
+    (0x5580, 0x06),
+    (0x5588, 0x00),
+    (0x5583, 0x40),
+    (0x5584, 0x2c),
+    (ISP_CONTROL_01, 0x83), // turn color matrix, awb and SDE
+    (REGLIST_TAIL, 0x00),   // tail
+];
