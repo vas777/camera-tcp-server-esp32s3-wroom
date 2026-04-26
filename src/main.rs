@@ -125,7 +125,35 @@ fn main() -> ! {
                 if to_print.contains("\r\n\r\n") {
                     print!("{}", to_print);
                     println!();
-                    break;
+
+                    if to_print.contains("GET /favicon.ico") {
+                        let _ = ap_socket
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                        let _ = ap_socket.flush();
+                        ap_socket.close();
+                        continue;
+                    }
+
+                    if to_print.contains("GET / HTTP/1.1") {
+                        println!("Serving HTML Dashboard");
+                        let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+                        let _ = ap_socket.write_all(header);
+                        // Notice we changed the HTML image src inside here to point to "/stream"
+                        let html_page = include_str!("../dashboard.txt");
+                        let _ = ap_socket.write_all(html_page.as_bytes());
+                        let _ = ap_socket.flush();
+                        ap_socket.close();
+                        continue; // Wait for the browser to reconnect and ask for /stream
+                    }
+
+                    if to_print.contains("GET /stream HTTP/1.1") {
+                        println!("Browser requested the video stream!");
+                        break;
+                    }
+
+                    // If it's anything else, close it
+                    ap_socket.close();
+                    continue;
                 }
 
                 pos += len;
@@ -201,7 +229,7 @@ fn main() -> ! {
 
                 // If this chunk contained the EOF signal, the frame is complete
                 if ends_with_eof {
-                    println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
+                    // println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
 
                     // Close the frame payload with a carriage return
                     if ap_socket.write_all(b"\r\n").is_err() || ap_socket.flush().is_err() {
