@@ -8,12 +8,15 @@ use smoltcp::iface::{SocketSet, SocketStorage};
 extern crate alloc;
 use alloc::boxed::Box;
 
-
-pub fn init_wifi_stack<'a>(wifi: WIFI<'a>) -> (Stack<'a, esp_radio::wifi::WifiDevice<'a>>, WifiController<'a>) {
-
+pub fn init_wifi_stack<'a>(
+    wifi: WIFI<'a>,
+) -> (
+    Stack<'a, esp_radio::wifi::WifiDevice<'a>>,
+    WifiController<'a>,
+) {
     let esp_radio_ctrl = Box::new(esp_radio::init().unwrap());
     let box_ctrl = Box::leak(esp_radio_ctrl);
-     // 1. Init wifi
+    // 1. Init wifi
     // interrupts must be active when we call this new
     let (mut controller, interfaces) =
         esp_radio::wifi::new(box_ctrl, wifi, Default::default()).unwrap();
@@ -31,7 +34,8 @@ pub fn init_wifi_stack<'a>(wifi: WIFI<'a>) -> (Stack<'a, esp_radio::wifi::WifiDe
     let ap_socket_set_entries: Box<[SocketStorage; 3]> = Box::new(Default::default());
     let boxed_set = Box::leak(ap_socket_set_entries);
     let ap_socket_set = SocketSet::new(&mut boxed_set[..]);
-    let mut ap_stack: Stack<'_, esp_radio::wifi::WifiDevice<'_>> = Stack::new(ap_interface, ap_device, ap_socket_set, now, rng.random());
+    let mut ap_stack: Stack<'_, esp_radio::wifi::WifiDevice<'_>> =
+        Stack::new(ap_interface, ap_device, ap_socket_set, now, rng.random());
 
     // 5. Crate access point
     let client_config =
@@ -68,15 +72,13 @@ pub fn init_wifi_stack<'a>(wifi: WIFI<'a>) -> (Stack<'a, esp_radio::wifi::WifiDe
             ),
         ))
         .unwrap();
-    
 
     let stats: HeapStats = esp_alloc::HEAP.stats();
     println!("{}", stats);
 
     (ap_stack, controller)
-
 }
-   
+
 // some smoltcp boilerplate
 fn timestamp() -> smoltcp::time::Instant {
     smoltcp::time::Instant::from_micros(
@@ -94,9 +96,6 @@ fn parse_ip(ip: &str) -> [u8; 4] {
     result
 }
 
-
-
-
 pub fn create_interface(device: &mut esp_radio::wifi::WifiDevice) -> smoltcp::iface::Interface {
     // users could create multiple instances but since they only have one WifiDevice
     // they probably can't do anything bad with that
@@ -108,4 +107,3 @@ pub fn create_interface(device: &mut esp_radio::wifi::WifiDevice) -> smoltcp::if
         timestamp(),
     )
 }
-

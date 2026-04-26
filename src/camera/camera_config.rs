@@ -3,22 +3,22 @@ use esp_hal::{
     i2c::{self, master::I2c},
 };
 
-pub (crate)const OV3660_ADDRESS: u8 = 0x3c;
+pub(crate) const OV3660_ADDRESS: u8 = 0x3c;
 
-pub (crate)struct Sccb<'d> {
+pub(crate) struct Sccb<'d> {
     i2c: I2c<'d, Blocking>,
 }
 
 impl<'d> Sccb<'d> {
-    pub (crate)fn new(i2c: I2c<'d, Blocking>) -> Self {
+    pub(crate) fn new(i2c: I2c<'d, Blocking>) -> Self {
         Self { i2c }
     }
 
-    pub (crate)fn probe(&mut self, slv_address: u8) -> Result<(), i2c::master::Error> {
+    pub(crate) fn probe(&mut self, slv_address: u8) -> Result<(), i2c::master::Error> {
         self.i2c.write(slv_address, &[])
     }
 
-    pub (crate)fn read(&mut self, slv_address: u8, reg: &[u8]) -> Result<u8, i2c::master::Error> {
+    pub(crate) fn read(&mut self, slv_address: u8, reg: &[u8]) -> Result<u8, i2c::master::Error> {
         self.i2c.write(slv_address, reg)?;
 
         let mut bytes = [0u8; 1];
@@ -26,7 +26,7 @@ impl<'d> Sccb<'d> {
         Ok(bytes[0])
     }
 
-    pub (crate)fn write(
+    pub(crate) fn write(
         &mut self,
         slv_address: u8,
         reg: &[u8],

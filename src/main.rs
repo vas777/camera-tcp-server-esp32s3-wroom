@@ -9,6 +9,7 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use camera_tcp_server::{camera::cam_init, wifi::init_wifi_stack};
 use embedded_io::*;
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -19,7 +20,6 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println::{print, println};
-use camera_tcp_server::{camera::cam_init, wifi::init_wifi_stack};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -40,13 +40,8 @@ fn main() -> ! {
     // peripherals.GPIO
     let peripherals = esp_hal::init(config);
 
-    // TODO: why reclaimed is necessary ?
     // - `reclaimed`: Memory reclaimed from the esp-idf bootloader.
-    // just removing make it panic
-    // TODO: why I get runtime panic ?
-    // why this is not detected on compile time ?
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    // just 64 was enough to start
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -63,6 +58,7 @@ fn main() -> ! {
     // on interrupt-driven preemptions to pause your main code
     esp_rtos::start(timg0.timer0);
 
+    // controller must be preserved
     let (ap_stack, controller) = init_wifi_stack(peripherals.WIFI);
 
     println!(
@@ -112,110 +108,115 @@ fn main() -> ! {
         }
 
         // 11. Did someone connected ?
-        if ap_socket.is_connected() {
-            println!("Connected");
+        if !ap_socket.is_connected() {
+            continue;
+        }
 
-            let mut time_out = false;
-            let deadline = time::Instant::now() + Duration::from_secs(20);
-            // TODO: is 1024 magic number or requirment here ?
-            let mut buffer = [0u8; 1024];
-            let mut pos = 0;
+        println!("Connected");
+
+        let deadline = time::Instant::now() + Duration::from_secs(20);
+        // TODO: is 1024 magic number or requirment here ?
+        let mut buffer = [0u8; 1024];
+        let mut pos = 0;
+        loop {
+            if let Ok(len) = ap_socket.read(&mut buffer[pos..]) {
+                let to_print = unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+
+                if to_print.contains("\r\n\r\n") {
+                    print!("{}", to_print);
+                    println!();
+                    break;
+                }
+
+                pos += len;
+            } else {
+                break;
+            }
+
+            if time::Instant::now() > deadline {
+                println!("Timeout");
+                break;
+            }
+        }
+
+        println!("Client connected! Starting video stream.");
+
+        // in case of reaload remove remaining bytes from DMA buffer
+        let (camera, returned_buf) = transfer.stop();
+        transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
+
+        // send once per connection Main HTTP Header
+        let header =
+            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+        if ap_socket.write_all(header).is_err() {
+            println!("Client dropped before header was sent.");
+            ap_socket.close();
+            continue;
+        }
+        // println!("Header was sent.");
+        ap_socket.flush().unwrap_or_default();
+
+        // 12. Let's send our video feed
+        // break this loop if somethig with socket
+        // like reload/repeated request of the page
+        'start_new_stream: loop {
+            // send once per frame Boundary Header
+            let frame_header = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+            if ap_socket.write_all(frame_header).is_err() {
+                break 'start_new_stream;
+            }
+            ap_socket.flush().unwrap_or_default();
+            // println!("Frame boundary was sent.");
+            let mut jpeg_total_bytes = 0;
+
+            // Reads the DMA chunks until EOF for this specific frame
             loop {
-                if let Ok(len) = ap_socket.read(&mut buffer[pos..]) {
-                    let to_print =
-                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+                let (data, ends_with_eof) = transfer.peek_until_eof();
 
-                    if to_print.contains("\r\n\r\n") {
-                        print!("{}", to_print);
-                        println!();
+                if data.is_empty() {
+                    if transfer.is_done() {
+                        println!("Network lag detected. Dropping frame...");
+                        let (camera, returned_buf) = transfer.stop();
+                        transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
                         break;
                     }
-
-                    pos += len;
-                } else {
-                    break;
+                    // good time advance network
+                    ap_socket.work();
+                    continue;
                 }
 
-                if time::Instant::now() > deadline {
-                    println!("Timeout");
-                    time_out = true;
-                    break;
-                }
-            }
+                let bytes_peeked = data.len();
+                jpeg_total_bytes += bytes_peeked;
 
-            // 12. Let's send our video feed
-            'start_again: loop {
-                println!("Client connected! Starting video stream.");
-
-                // send once per connection Main HTTP Header
-                let header = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-                ap_socket.write_all(header).unwrap();
-
-                loop {
-                    // send once per frame Boundary Header
-                    let frame_header = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-                    ap_socket.write_all(frame_header).unwrap();
-
-                    let mut jpeg_total_bytes = 0;
-
-                    // Reads the DMA chunks until EOF for this specific frame
-                    loop {
-                        let (data, ends_with_eof) = transfer.peek_until_eof();
-
-                        if data.is_empty() {
-                            // good time advance network
-                            ap_socket.work();
-                            // controller.
-
-                            if transfer.is_done() {
-                                println!("Network lag detected. Dropping frame...");
-                                let (camera, returned_buf) = transfer.stop();
-                                transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
-                                break;
-                            }
-                            continue;
-                        }
-
-                        let bytes_peeked = data.len();
-                        jpeg_total_bytes += bytes_peeked;
-
-                        // TODO: experiment wiht chunk sizes
-                        // Stream the binary image chunks
-                        for chunk in data.chunks(1024) {
-                            if let Err(_) = ap_socket.write_all(chunk) {
-                                // TODO: realod often fails here. fix me (better)
-                                break 'start_again;
-                            }
-                        }
-
-                        // Free the DMA buffer
+                // Stream the binary image chunks
+                for chunk in data.chunks(1460) {
+                    if let Err(_) = ap_socket.write_all(chunk) {
                         transfer.consume(bytes_peeked);
+                        break 'start_new_stream;
+                    }
+                }
 
-                        // If this chunk contained the EOF signal, the frame is complete
-                        if ends_with_eof {
-                            println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
+                // Free the DMA buffer
+                transfer.consume(bytes_peeked);
 
-                            // Close the frame payload with a carriage return
-                            ap_socket.write_all(b"\r\n").unwrap();
-                            ap_socket.flush().unwrap();
-                            // Break out of the INNER loop.
-                            break;
-                        }
-                    } // Inner Loop
-                } // Outer Loop
-            }
+                // If this chunk contained the EOF signal, the frame is complete
+                if ends_with_eof {
+                    println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
 
-            ap_socket.close();
+                    // Close the frame payload with a carriage return
+                    if ap_socket.write_all(b"\r\n").is_err() || ap_socket.flush().is_err() {
+                        break 'start_new_stream;
+                    }
+                    // Break out of the DMA loop.
+                    // println!("Frame was sent.");
+                    break;
+                }
+            } // DMA Loop
+        } // frames Loop
 
-            println!("Done\n");
-            println!();
-        }
+        ap_socket.close();
 
-        let start = time::Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            ap_socket.work();
-        }
-    }
+        println!("Done\n");
+        println!();
+    } // Start the stream loop
 }
-
-
