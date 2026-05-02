@@ -13,6 +13,8 @@ use camera_tcp_server::camera::cam_init;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
+use embassy_sync::channel::Channel;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_net::{
     IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket,
 };
@@ -46,6 +48,8 @@ macro_rules! mk_static {
 }
 
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
+
+static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, [u8; 1024], 4> = Channel::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -178,8 +182,6 @@ async fn main(spawner: Spawner) -> ! {
             continue;
         }
 
-        use embedded_io_async::Write;
-
         let mut buffer = [0u8; 1024];
         let mut pos = 0;
         loop {
@@ -199,21 +201,23 @@ async fn main(spawner: Spawner) -> ! {
 
                         if to_print.contains("GET /favicon.ico") {
                             let _ = socket
-                                .write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                                .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                                 .await;
-                            let _ = socket.flush().await;
                             socket.close();
+                            // need to flush so close is acked upon 
+                            // in time
+                            let _ = socket.flush().await;
                             continue;
                         }
 
                         if to_print.contains("GET / HTTP/1.1") {
                             println!("Serving HTML Dashboard");
-                            let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+                            let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n";
                             let _ = socket.write(header).await;
                             let html_page = include_str!("../dashboard.html");
                             let _ = socket.write(html_page.as_bytes()).await;
-                            let _ = socket.flush().await;
                             socket.close();
+                            let _ = socket.flush().await;
                             continue; // Wait for the browser to reconnect and ask for /stream
                         }
 
@@ -224,6 +228,7 @@ async fn main(spawner: Spawner) -> ! {
 
                         // If it's anything else, close it
                         socket.close();
+                        let _ = socket.flush().await;
                         continue;
                     }
 
@@ -278,8 +283,8 @@ async fn main(spawner: Spawner) -> ! {
                             transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
                             break;
                         }
-                        // TODO; is there work equivalent ?
-                        // socket.work;
+                        // is there work equivalent ?
+                        // yes runner.run;
                         continue;
                     }
 
