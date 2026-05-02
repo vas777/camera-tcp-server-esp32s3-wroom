@@ -96,7 +96,7 @@ pub(crate) const SENSOR_FRAMESIZE_SVGA: &[(u16, u8)] = &[
     // 7. JPEG Compression Quality (QS)
     // Lower value = Better quality / Larger file size. (Valid range roughly 0x04 to 0x3F)
     // 0x04 = Excellent, 0x08 = Good/Standard, 0x10+ = Poor
-    (0x4407, 0x04),
+    (0x4407, 0x10),
 ];
 
 // TODO: does not work

@@ -13,16 +13,20 @@ use camera_tcp_server::camera::cam_init;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
-use embassy_sync::channel::Channel;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_net::{
     IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket,
 };
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::CpuClock, interrupt::software::SoftwareInterruptControl, ram, rng::Rng,
+    clock::CpuClock,
+    interrupt::software::SoftwareInterruptControl,
+    lcd_cam::cam::{Camera, CameraTransfer},
+    ram,
+    rng::Rng,
     timer::timg::TimerGroup,
 };
 use esp_println::{print, println};
@@ -49,13 +53,24 @@ macro_rules! mk_static {
 
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 
-static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, [u8; 1024], 4> = Channel::new();
+pub enum CameraMessage {
+    /// A chunk of video data. Contains the buffer and the number of valid bytes.
+    VideoChunk([u8; 1024], usize),
+
+    /// Signal that the JPEG frame is completely finished
+    EndOfFrame,
+
+    /// Optional: Signal that the hardware crashed and needs a reset
+    HardwareError,
+}
+
+static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, 4> = Channel::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     // TODO :why?
     // DEBUG - failed to transmit IP: device exhausted
-    esp_println::logger::init_logger(log::LevelFilter::Error);
+    esp_println::logger::init_logger(log::LevelFilter::Debug);
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     // all peripherals are `generated` at compile time as singletons
     // peripherals.WIFI
@@ -113,7 +128,7 @@ async fn main(spawner: Spawner) -> ! {
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
-    
+
     // TODO worker for camera ?
     let camera = cam_init(
         peripherals.LCD_CAM,
@@ -136,16 +151,13 @@ async fn main(spawner: Spawner) -> ! {
     )
     .unwrap();
 
-    // TODO with embassy this got smaller why ? 
-    let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(110 * 1000);
-    let mut transfer = camera.receive(dma_rx_buf).map_err(|e| e.0).unwrap();
-
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).unwrap());
+    spawner.spawn(camera_task(camera).unwrap());
 
     let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 65536];
+    let mut tx_buffer = [0; 16384];
 
     loop {
         if stack.is_link_up() {
@@ -204,7 +216,7 @@ async fn main(spawner: Spawner) -> ! {
                                 .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                                 .await;
                             socket.close();
-                            // need to flush so close is acked upon 
+                            // need to flush so close is acked upon
                             // in time
                             let _ = socket.flush().await;
                             continue;
@@ -217,6 +229,7 @@ async fn main(spawner: Spawner) -> ! {
                             let html_page = include_str!("../dashboard.html");
                             let _ = socket.write(html_page.as_bytes()).await;
                             socket.close();
+
                             let _ = socket.flush().await;
                             continue; // Wait for the browser to reconnect and ask for /stream
                         }
@@ -241,87 +254,59 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
         }
-
         println!("Starting video stream.");
 
-        // in case of reaload remove remaining bytes from DMA buffer
-        let (camera, returned_buf) = transfer.stop();
-        transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
-
-            // send once per connection Main HTTP Header
+        loop {
+            // must send once per connection
             let header =
-                b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
             if socket.write(header).await.is_err() {
                 println!("Client dropped before header was sent.");
                 socket.close();
-                continue;
+                let _ = socket.flush().await;
+                break;
             }
-            // println!("Header was sent.");
-            socket.flush().await.unwrap_or_default();
+            println!("Header was sent.");
+            let _ = socket.flush().await;
 
-            // 12. Let's send our video feed
-            // break this loop if somethig with socket
-            // like reload/repeated request of the page
-            'start_new_stream: loop {
-                // send once per frame Boundary Header
-                let frame_header = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-                if socket.write(frame_header).await.is_err() {
-                    break 'start_new_stream;
-                }
-                socket.flush().await.unwrap_or_default();
-                // println!("Frame boundary was sent.");
-                let mut jpeg_total_bytes = 0;
-
-                // Reads the DMA chunks until EOF for this specific frame
-                loop {
-                    let (data, ends_with_eof) = transfer.peek_until_eof();
-
-                    if data.is_empty() {
-                        if transfer.is_done() {
-                            println!("Network lag detected. Dropping frame...");
-                            let (camera, returned_buf) = transfer.stop();
-                            transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
+            loop {
+                match VIDEO_CHANNEL.receive().await {
+                    CameraMessage::VideoChunk(buffer, length) => {
+                        // println!("CameraMessage::VideoChunk {}", length);
+                        if socket.write(&buffer[..length]).await.is_err() {
+                            // Browser disconnected
                             break;
                         }
-                        // is there work equivalent ?
-                        // yes runner.run;
-                        continue;
+                        // flushing here was bad decision
+                        // as it will ask for ACK for each buffer
                     }
-
-                    let bytes_peeked = data.len();
-                    jpeg_total_bytes += bytes_peeked;
-
-                    // Stream the binary image chunks
-                    for chunk in data.chunks(1460) {
-                        if socket.write(chunk).await.is_err() {
-                            transfer.consume(bytes_peeked);
-                            break 'start_new_stream;
+                    CameraMessage::EndOfFrame => {
+                        // println!("CameraMessage::EndOfFrame");
+                        let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+                        if socket.write(boundary).await.is_err() {
+                            break;
                         }
+                        let _ = socket.flush().await;
                     }
-
-                    // Free the DMA buffer
-                    transfer.consume(bytes_peeked);
-
-                    // If this chunk contained the EOF signal, the frame is complete
-                    if ends_with_eof {
-                        // println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
-
-                        // Close the frame payload with a carriage return
-                        if socket.write(b"\r\n").await.is_err() || socket.flush().await.is_err() {
-                            break 'start_new_stream;
-                        }
-                        // Break out of the DMA loop.
-                        // println!("Frame was sent.");
+                    CameraMessage::HardwareError => {
+                        println!("Camera died, closing connection to force client refresh.");
                         break;
                     }
-                } // DMA Loop
-            } // frames Loop
+                }
+            }
 
-            socket.close();
+            let _ = socket.write(b"\r\n").await;
+            let _ = socket.flush().await;
 
-            println!("Done\n");
-            println!();
-    } // Start the stream loop
+            break;
+        }
+
+        socket.close();
+        let _ = socket.flush().await;
+
+        println!("Done\n");
+        println!();
+    }
 }
 
 #[embassy_executor::task]
@@ -397,4 +382,61 @@ async fn connection(controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
+}
+
+use embassy_futures::yield_now;
+#[embassy_executor::task]
+async fn camera_task(camera: Camera<'static>) {
+    // TODO with embassy this got smaller why ?
+    let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(110 * 1024);
+    let mut transfer = camera.receive(dma_rx_buf).map_err(|e| e.0).unwrap();
+    println!("Started camera");
+    loop {
+        // must scope the borrowed data buffer
+        // use it within scope for sending to channel
+        let (bytes_to_consume, eof_reached, is_done) = {
+            let (data, ends_with_eof) = transfer.peek_until_eof();
+
+            if data.is_empty() {
+                // No data yet, return early to drop the borrow
+                // println!("data.is_empty()");
+                (0, ends_with_eof, transfer.is_done())
+            } else {
+                let mut fixed_array = [0u8; 1024];
+
+                for chunk in data.chunks(1024) {
+                    fixed_array[..chunk.len()].copy_from_slice(chunk);
+
+                    // println!("sending chunk {}",chunk.len());
+                    let _ =
+                        VIDEO_CHANNEL.try_send(CameraMessage::VideoChunk(fixed_array, chunk.len()));
+                }
+
+                (data.len(), ends_with_eof, transfer.is_done())
+            }
+        };
+
+        if bytes_to_consume > 0 {
+            transfer.consume(bytes_to_consume);
+        } else {
+            // If we had no data to consume, check if the transfer finished.
+            if is_done {
+                // DMA is full - reset it
+                println!("is_done");
+                let (camera, returned_buf) = transfer.stop();
+                transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
+                let _ = VIDEO_CHANNEL.try_send(CameraMessage::EndOfFrame);
+            }
+
+            // nothing to consume 
+            // good time to yield
+            yield_now().await;
+            continue;
+        }
+
+        if eof_reached {
+            let _ = VIDEO_CHANNEL.try_send(CameraMessage::EndOfFrame);
+            yield_now().await;
+        }
+    }
 }
