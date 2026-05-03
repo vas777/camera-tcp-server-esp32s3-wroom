@@ -353,9 +353,7 @@ async fn tcp_task(stack: Stack<'static>) {
                             let _ = socket
                                 .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                                 .await;
-                            socket.close();
-                            // need to flush so close is acked in time
-                            let _ = socket.flush().await;
+                            socket.abort();
                             continue 'outer;
                         }
 
