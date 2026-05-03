@@ -13,6 +13,7 @@ use camera_tcp_server::camera::cam_init;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
+
 use embassy_futures::yield_now;
 use embassy_net::{
     IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket,
@@ -22,12 +23,14 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::system::Stack as ProcStack;
 use esp_hal::{
     clock::CpuClock, interrupt::software::SoftwareInterruptControl, lcd_cam::cam::Camera, ram,
     rng::Rng, timer::timg::TimerGroup,
 };
 use esp_println::{print, println};
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, ap::AccessPointConfig};
+use esp_rtos::embassy::Executor;
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -148,10 +151,25 @@ async fn main(spawner: Spawner) -> ! {
     )
     .unwrap();
 
+    // https://github.com/esp-rs/esp-hal/blob/main/examples/async/embassy_multicore/src/main.rs
+    const CAMERA_STACK_SIZE: usize = 12288;
+    let app_core_stack = mk_static!(ProcStack<CAMERA_STACK_SIZE>, ProcStack::new());
+    esp_rtos::start_second_core(
+        peripherals.CPU_CTRL,
+        sw_int.software_interrupt1,
+        app_core_stack,
+        move || {
+            static EXECUTOR: static_cell::StaticCell<Executor> = static_cell::StaticCell::new();
+            let executor = EXECUTOR.init(Executor::new());
+            executor.run(|spawner| {
+                spawner.spawn(camera_task(camera).unwrap());
+            });
+        },
+    );
+
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).unwrap());
-    spawner.spawn(camera_task(camera).unwrap());
     spawner.spawn(tcp_task(stack).unwrap());
 
     loop {
@@ -295,6 +313,8 @@ async fn camera_task(camera: Camera<'static>) {
 
             // nothing to consume
             // good time to yield
+            // TODO: with second core we still needs this
+            // read about WTI; TWDT
             yield_now().await;
             continue;
         }

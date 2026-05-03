@@ -23,7 +23,7 @@ esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
 edge-dhcp = "0.7.0"
 edge-nal = "0.6.0"
 edge-nal-embassy = "0.8.1"
-embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-executor = { version = "0.10.0", features = ["log", "executor-thread" ] }
 embassy-net = { version = "0.8.0", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "log" ] }
 
 embassy-time = "0.5.0"
