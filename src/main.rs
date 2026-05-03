@@ -152,9 +152,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).unwrap());
     spawner.spawn(camera_task(camera).unwrap());
-
-    let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 32768];
+    spawner.spawn(tcp_task(stack).unwrap());
 
     loop {
         if stack.is_link_up() {
@@ -172,129 +170,8 @@ async fn main(spawner: Spawner) -> ! {
     stack
         .config_v4()
         .inspect(|c| println!("ipv4 config: {c:?}"));
-
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-
     loop {
-        println!("Wait for connection...");
-        let r = socket
-            .accept(IpListenEndpoint {
-                addr: None,
-                port: 8080,
-            })
-            .await;
-        println!("Connected...");
-
-        if let Err(e) = r {
-            println!("connect error: {:?}", e);
-            continue;
-        }
-
-        let mut buffer = [0u8; 1024];
-        let mut pos = 0;
-        loop {
-            match socket.read(&mut buffer[pos..]).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
-                }
-
-                Ok(len) => {
-                    let to_print =
-                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-
-                    if to_print.contains("\r\n\r\n") {
-                        print!("{}", to_print);
-                        println!();
-
-                        if to_print.contains("GET /favicon.ico") {
-                            let _ = socket
-                                .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                                .await;
-                            socket.close();
-                            // need to flush so close is acked upon
-                            // in time
-                            let _ = socket.flush().await;
-                            continue;
-                        }
-
-                        if to_print.contains("GET / HTTP/1.1") {
-                            println!("Serving HTML Dashboard");
-                            let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n";
-                            let _ = socket.write(header).await;
-                            let html_page = include_str!("../dashboard.html");
-                            let _ = socket.write(html_page.as_bytes()).await;
-                            socket.close();
-
-                            let _ = socket.flush().await;
-                            continue; // Wait for the browser to reconnect and ask for /stream
-                        }
-
-                        if to_print.contains("GET /stream HTTP/1.1") {
-                            println!("Browser requested the video stream!");
-                            break;
-                        }
-
-                        // If it's anything else, close it
-                        socket.close();
-                        let _ = socket.flush().await;
-                        continue;
-                    }
-
-                    pos += len;
-                }
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    socket.close();
-                    break;
-                }
-            }
-        }
-        println!("Starting video stream.");
-
-        let header =
-            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        if socket.write(header).await.is_err() {
-            println!("Client dropped before header was sent.");
-            socket.close();
-            let _ = socket.flush().await;
-            // break;
-        }
-        println!("Header was sent.");
-        let _ = socket.flush().await;
-
-        loop {
-            match VIDEO_CHANNEL.receive().await {
-                CameraMessage::VideoChunk(buffer, length) => {
-                    // println!("CameraMessage::VideoChunk {}", length);
-                    if socket.write(&buffer[..length]).await.is_err() {
-                        // Browser disconnected
-                        break;
-                    }
-                    // flushing here was bad decision
-                    // as it will ask for ACK for each buffer
-                }
-                CameraMessage::EndOfFrame => {
-                    // println!("CameraMessage::EndOfFrame");
-                    let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-                    if socket.write(boundary).await.is_err() {
-                        break;
-                    }
-                    let _ = socket.flush().await;
-                }
-                CameraMessage::HardwareError => {
-                    println!("Camera died, closing connection to force client refresh.");
-                    break;
-                }
-            }
-        }
-
-        let _ = socket.write(b"\r\n").await;
-        socket.close();
-        let _ = socket.flush().await;
-        println!("Done\n");
-        println!();
+        core::future::pending::<()>().await;
     }
 }
 
@@ -426,5 +303,139 @@ async fn camera_task(camera: Camera<'static>) {
             let _ = VIDEO_CHANNEL.try_send(CameraMessage::EndOfFrame);
             yield_now().await;
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn tcp_task(stack: Stack<'static>) {
+    println!("Start tcp task...");
+    let mut rx_buffer = [0; 1536];
+    let mut tx_buffer = [0; 32768];
+
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+
+    'outer: loop {
+        println!("Wait for connection...");
+        let r = socket
+            .accept(IpListenEndpoint {
+                addr: None,
+                port: 8080,
+            })
+            .await;
+        println!("Connected...");
+
+        if let Err(e) = r {
+            println!("connect error: {:?}", e);
+            continue;
+        }
+
+        let mut buffer = [0u8; 1024];
+        let mut pos = 0;
+        loop {
+            match socket.read(&mut buffer[pos..]).await {
+                Ok(0) => {
+                    println!("read EOF");
+                    socket.close();
+                    let _ = socket.flush().await;
+                    continue 'outer;
+                }
+
+                Ok(len) => {
+                    let to_print =
+                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+
+                    if to_print.contains("\r\n\r\n") {
+                        print!("{}", to_print);
+                        println!();
+
+                        if to_print.contains("GET /favicon.ico") {
+                            let _ = socket
+                                .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                            socket.close();
+                            // need to flush so close is acked in time
+                            let _ = socket.flush().await;
+                            continue 'outer;
+                        }
+
+                        if to_print.contains("GET / HTTP/1.1") {
+                            println!("Serving HTML Dashboard");
+                            let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n";
+                            let _ = socket.write(header).await;
+                            let html_page = include_str!("../dashboard.html");
+                            let _ = socket.write(html_page.as_bytes()).await;
+                            socket.close();
+
+                            let _ = socket.flush().await;
+                            // Wait for the browser to reconnect and ask for /stream
+                            continue 'outer;
+                        }
+
+                        if to_print.contains("GET /stream HTTP/1.1") {
+                            println!("Browser requested the video stream!");
+                            break;
+                        }
+
+                        // If it's anything else, close it
+                        socket.close();
+                        let _ = socket.flush().await;
+                        continue 'outer;
+                    }
+
+                    pos += len;
+                }
+                Err(e) => {
+                    println!("read error: {:?}", e);
+                    socket.close();
+                    continue 'outer;
+                }
+            }
+        }
+
+        println!("Starting video stream.");
+
+        let header =
+            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+        if socket.write(header).await.is_err() {
+            println!("Client dropped before header was sent.");
+            socket.close();
+            let _ = socket.flush().await;
+            continue 'outer;
+        }
+        println!("Header was sent.");
+        let _ = socket.flush().await;
+
+        loop {
+            match VIDEO_CHANNEL.receive().await {
+                CameraMessage::VideoChunk(buffer, length) => {
+                    // println!("CameraMessage::VideoChunk {}", length);
+                    if socket.write(&buffer[..length]).await.is_err() {
+                        // Browser disconnected
+                        break;
+                    }
+                    // flushing here was bad decision
+                    // as it will ask for ACK for each buffer
+                }
+                CameraMessage::EndOfFrame => {
+                    // println!("CameraMessage::EndOfFrame");
+                    let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+                    if socket.write(boundary).await.is_err() {
+                        break;
+                    }
+                    let _ = socket.flush().await;
+                }
+                CameraMessage::HardwareError => {
+                    println!("Camera died, closing connection to force client refresh.");
+                    break;
+                }
+            }
+        }
+
+        let _ = socket.write(b"\r\n").await;
+        socket.close();
+        let _ = socket.flush().await;
+        println!("Done\n");
+        println!();
     }
 }
