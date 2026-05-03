@@ -13,6 +13,7 @@ use camera_tcp_server::camera::cam_init;
 use core::{net::Ipv4Addr, str::FromStr};
 
 use embassy_executor::Spawner;
+use embassy_futures::yield_now;
 use embassy_net::{
     IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket,
 };
@@ -22,12 +23,8 @@ use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::CpuClock,
-    interrupt::software::SoftwareInterruptControl,
-    lcd_cam::cam::{Camera, CameraTransfer},
-    ram,
-    rng::Rng,
-    timer::timg::TimerGroup,
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, lcd_cam::cam::Camera, ram,
+    rng::Rng, timer::timg::TimerGroup,
 };
 use esp_println::{print, println};
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, ap::AccessPointConfig};
@@ -64,7 +61,7 @@ pub enum CameraMessage {
     HardwareError,
 }
 
-static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, 4> = Channel::new();
+static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, 16> = Channel::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -157,7 +154,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(camera_task(camera).unwrap());
 
     let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 16384];
+    let mut tx_buffer = [0; 32768];
 
     loop {
         if stack.is_link_up() {
@@ -256,54 +253,46 @@ async fn main(spawner: Spawner) -> ! {
         }
         println!("Starting video stream.");
 
-        loop {
-            // must send once per connection
-            let header =
+        let header =
             b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-            if socket.write(header).await.is_err() {
-                println!("Client dropped before header was sent.");
-                socket.close();
-                let _ = socket.flush().await;
-                break;
-            }
-            println!("Header was sent.");
+        if socket.write(header).await.is_err() {
+            println!("Client dropped before header was sent.");
+            socket.close();
             let _ = socket.flush().await;
-
-            loop {
-                match VIDEO_CHANNEL.receive().await {
-                    CameraMessage::VideoChunk(buffer, length) => {
-                        // println!("CameraMessage::VideoChunk {}", length);
-                        if socket.write(&buffer[..length]).await.is_err() {
-                            // Browser disconnected
-                            break;
-                        }
-                        // flushing here was bad decision
-                        // as it will ask for ACK for each buffer
-                    }
-                    CameraMessage::EndOfFrame => {
-                        // println!("CameraMessage::EndOfFrame");
-                        let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-                        if socket.write(boundary).await.is_err() {
-                            break;
-                        }
-                        let _ = socket.flush().await;
-                    }
-                    CameraMessage::HardwareError => {
-                        println!("Camera died, closing connection to force client refresh.");
-                        break;
-                    }
-                }
-            }
-
-            let _ = socket.write(b"\r\n").await;
-            let _ = socket.flush().await;
-
-            break;
+            // break;
         }
-
-        socket.close();
+        println!("Header was sent.");
         let _ = socket.flush().await;
 
+        loop {
+            match VIDEO_CHANNEL.receive().await {
+                CameraMessage::VideoChunk(buffer, length) => {
+                    // println!("CameraMessage::VideoChunk {}", length);
+                    if socket.write(&buffer[..length]).await.is_err() {
+                        // Browser disconnected
+                        break;
+                    }
+                    // flushing here was bad decision
+                    // as it will ask for ACK for each buffer
+                }
+                CameraMessage::EndOfFrame => {
+                    // println!("CameraMessage::EndOfFrame");
+                    let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+                    if socket.write(boundary).await.is_err() {
+                        break;
+                    }
+                    let _ = socket.flush().await;
+                }
+                CameraMessage::HardwareError => {
+                    println!("Camera died, closing connection to force client refresh.");
+                    break;
+                }
+            }
+        }
+
+        let _ = socket.write(b"\r\n").await;
+        socket.close();
+        let _ = socket.flush().await;
         println!("Done\n");
         println!();
     }
@@ -384,7 +373,6 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
 }
 
-use embassy_futures::yield_now;
 #[embassy_executor::task]
 async fn camera_task(camera: Camera<'static>) {
     // TODO with embassy this got smaller why ?
@@ -428,7 +416,7 @@ async fn camera_task(camera: Camera<'static>) {
                 let _ = VIDEO_CHANNEL.try_send(CameraMessage::EndOfFrame);
             }
 
-            // nothing to consume 
+            // nothing to consume
             // good time to yield
             yield_now().await;
             continue;
