@@ -129,7 +129,6 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
-    // TODO worker for camera ?
     let camera = cam_init(
         peripherals.LCD_CAM,
         peripherals.DMA_CH0,
@@ -151,7 +150,6 @@ async fn main(spawner: Spawner) -> ! {
     )
     .unwrap();
 
-    // https://github.com/esp-rs/esp-hal/blob/main/examples/async/embassy_multicore/src/main.rs
     const CAMERA_STACK_SIZE: usize = 12288;
     let app_core_stack = mk_static!(ProcStack<CAMERA_STACK_SIZE>, ProcStack::new());
     esp_rtos::start_second_core(
