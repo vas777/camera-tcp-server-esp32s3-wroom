@@ -43,7 +43,7 @@ Main ones are:
 
 # Try UDP with relay
 
-ESP32 -> Jpeg Frames/UDP -> relay -> WebSocket/TCP OR webRTC/UDP -> Browser
+ESP32 -> Jpeg Frames/UDP -> relay <-> WebSocket/TCP OR webRTC/UDP -> Browser
 
 1. Read full jpeg frame from camera
 2. Calculate total_chunks
