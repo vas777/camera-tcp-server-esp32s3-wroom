@@ -8,3 +8,7 @@ default = []
 std = []
 
 [dependencies]
+
+[dev-dependencies]
+quickcheck = "1.1.0"
+rand = "0.10.1"
