@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::net::UdpSocket;
+use tokio::net::UdpSocket;
 use shared::{JpegFrameChunk, STRUCT_CHUNK_SIZE};
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() {
     // Bind to the address the ESP32 is targeting.
     // "0.0.0.0" allows listening on all interfaces, including the one 
     // connected to the ESP32 Access Point.
-    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    let socket = UdpSocket::bind("0.0.0.0:5000").await.expect("Failed to bind UDP socket");
     println!("Relay listening on 0.0.0.0:5000...");
 
     // Buffer to hold raw packet data. Must be at least STRUCT_CHUNK_SIZE.
@@ -17,9 +18,11 @@ fn main() -> std::io::Result<()> {
     let mut last_processed_frame = 0u16;
 
     loop {
-        let (amt, src) = socket.recv_from(&mut buf)?;
+        let (nbytes, src) = socket.recv_from(&mut buf).await.expect("Failed to receive UDP packet");
+        // Heartbeat: print for every packet received to verify the network path
+        println!("DEBUG: Received {} bytes from {}", nbytes, src);
 
-        if let Some(chunk) = JpegFrameChunk::from_bytes(&buf[..amt]) {
+        if let Some(chunk) = JpegFrameChunk::from_bytes(&buf[..nbytes]) {
             // Use a threshold to prevent memory leaks from incomplete frames
             if pending_frames.len() > 10 {
                 let current_id = chunk.frame_id;
