@@ -23,7 +23,7 @@ use embassy_net::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer};
-use esp_alloc as _;
+use esp_alloc::{self as _, HeapStats};
 use esp_backtrace as _;
 use esp_hal::system::Stack as ProcStack;
 use esp_hal::{
@@ -75,6 +75,8 @@ pub enum CameraMessage {
     HardwareError,
 }
 
+const CAMERA_STACK_SIZE: usize = 4096*3;
+
 static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, 8> = Channel::new();
 static STATION_CONNECTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -91,7 +93,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // - `reclaimed`: Memory reclaimed from the esp-idf bootloader.
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    // esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -162,7 +164,6 @@ async fn main(spawner: Spawner) -> ! {
     )
     .unwrap();
 
-    const CAMERA_STACK_SIZE: usize = 12288;
     let app_core_stack = mk_static!(ProcStack<CAMERA_STACK_SIZE>, ProcStack::new());
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -183,9 +184,11 @@ async fn main(spawner: Spawner) -> ! {
 
     // Optimized buffers for SVGA streaming
     let udp_frame_buffer = mk_static!([u8; 65536], [0u8; 65536]);
+
     let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
     let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
-    let udp_tx_meta = mk_static!([PacketMetadata; 16], [PacketMetadata::EMPTY; 16]);
+    
+    let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
     let udp_tx_payload = mk_static!([u8; 16384], [0u8; 16384]);
 
     spawner.spawn(udp_task(stack, udp_frame_buffer, udp_rx_meta, udp_rx_payload, udp_tx_meta, udp_tx_payload).unwrap());
@@ -201,9 +204,16 @@ async fn main(spawner: Spawner) -> ! {
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
+
     stack
         .config_v4()
         .inspect(|c| println!("ipv4 config: {c:?}"));
+
+    let stats: HeapStats = esp_alloc::HEAP.stats();
+    // HeapStats implements the Display and defmt::Format traits, so you can
+    // pretty-print the heap stats.
+    println!("{}", stats);
+
     loop {
         core::future::pending::<()>().await;
     }
@@ -333,7 +343,7 @@ async fn udp_task(
     frame_buffer: &'static mut [u8],
     rx_meta: &'static mut [PacketMetadata; 4],
     rx_payload: &'static mut [u8; 1024],
-    tx_meta: &'static mut [PacketMetadata; 16],
+    tx_meta: &'static mut [PacketMetadata; 20],
     tx_payload: &'static mut [u8; 16384],
 ) {
     println!("Start UDP task...");
