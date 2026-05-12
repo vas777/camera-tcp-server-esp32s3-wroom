@@ -13,6 +13,7 @@ pub struct JpegFrameChunk {
 }
 
 impl JpegFrameChunk {
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; STRUCT_CHUNK_SIZE] {
         let mut res: [u8; STRUCT_CHUNK_SIZE] = [0u8; STRUCT_CHUNK_SIZE];
         res[0..2].copy_from_slice(&self.frame_id.to_be_bytes());
@@ -22,12 +23,13 @@ impl JpegFrameChunk {
         res[6..STRUCT_CHUNK_SIZE].copy_from_slice(&self.payload);
         res
     }
-
+    
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < STRUCT_CHUNK_SIZE {
             None
         } else {
-            Some(JpegFrameChunk {
+            Some(Self {
                 frame_id: u16::from_be_bytes(bytes[0..2].try_into().ok()?),
                 chunk_id: bytes[2],
                 total_chunks: bytes[3],
