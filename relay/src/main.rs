@@ -46,8 +46,10 @@ async fn main() {
                     .entry(chunk.frame_id)
                     .or_insert_with(|| vec![None; chunk.total_chunks as usize]);
 
-                if (chunk.chunk_id as usize) < entry.len() && entry[chunk.chunk_id as usize].is_none() {
-                    entry[chunk.chunk_id as usize] = Some(chunk.payload[..chunk.payload_len as usize].to_vec());
+                if let Some(slot) = entry.get_mut(chunk.chunk_id as usize) {
+                    if slot.is_none() {
+                        *slot = Some(chunk.payload[..chunk.payload_len as usize].to_vec());
+                    }
                 }
 
                 let received_count = entry.iter().filter(|c| c.is_some()).count();
