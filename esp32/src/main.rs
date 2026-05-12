@@ -16,6 +16,7 @@ use alloc::vec;
 
 use camera_tcp_server::camera::cam_init;
 use log::{debug, info, trace};
+use core::ops::Index;
 
 use embassy_executor::Spawner;
 
@@ -28,7 +29,7 @@ use embassy_net::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer};
-use esp_alloc as _;
+use esp_alloc::{self as _, HeapStats};
 use esp_backtrace as _;
 use esp_hal::system::Stack as ProcStack;
 use esp_hal::{
@@ -142,6 +143,7 @@ impl<T> MyBox<T> {
         MyBox(Box::new(val))
     }
 }
+
 static STATION_CONNECTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[esp_rtos::main]
@@ -262,7 +264,8 @@ async fn main(spawner: Spawner) -> ! {
     let udp_frame_buffer = mk_static!([u8; 32786], [0u8; 32786]);
     let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
     let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
-    let udp_tx_meta = mk_static!([PacketMetadata; 16], [PacketMetadata::EMPTY; 16]);
+    
+    let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
     let udp_tx_payload = mk_static!([u8; 16384], [0u8; 16384]);
 
     spawner.spawn(udp_task(stack, udp_frame_buffer, udp_rx_meta, udp_rx_payload, udp_tx_meta, udp_tx_payload).expect("Failed to spawn UDP task."));
@@ -279,9 +282,14 @@ async fn main(spawner: Spawner) -> ! {
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
-    stack.config_v4().inspect(|c| info!("ipv4 config: {c:?}"));
 
-    let stats: esp_alloc::HeapStats = esp_alloc::HEAP.stats();
+    stack
+        .config_v4()
+        .inspect(|c| println!("ipv4 config: {c:?}"));
+
+    let stats: HeapStats = esp_alloc::HEAP.stats();
+    // HeapStats implements the Display and defmt::Format traits, so you can
+    // pretty-print the heap stats.
     info!("{}", stats);
 
     loop {
@@ -445,7 +453,7 @@ async fn udp_task(
     frame_buffer: &'static mut [u8],
     rx_meta: &'static mut [PacketMetadata; 4],
     rx_payload: &'static mut [u8; 1024],
-    tx_meta: &'static mut [PacketMetadata; 16],
+    tx_meta: &'static mut [PacketMetadata; 20],
     tx_payload: &'static mut [u8; 16384],
 ) {
     info!("Start UDP task...");
@@ -479,6 +487,8 @@ async fn udp_task(
                     frame_buffer[current_pos..current_pos + length]
                         .copy_from_slice(&buffer.0[..length]);
                     current_pos += length;
+                } else {
+                    println!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
 
             }
@@ -516,6 +526,7 @@ async fn udp_task(
 
                 frame_id = frame_id.wrapping_add(1);
                 current_pos = 0;
+                chunk_id = 0;
             }
             CameraMessage::HardwareError => {
                 info!("Camera hardware error reported to UDP task.");
