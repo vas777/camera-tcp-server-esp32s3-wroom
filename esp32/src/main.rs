@@ -16,6 +16,7 @@ use alloc::vec;
 
 use camera_tcp_server::camera::cam_init;
 use log::{debug, info, trace};
+use core::ops::Index;
 
 use embassy_executor::Spawner;
 
@@ -486,6 +487,8 @@ async fn udp_task(
                     frame_buffer[current_pos..current_pos + length]
                         .copy_from_slice(&buffer.0[..length]);
                     current_pos += length;
+                } else {
+                    println!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
 
             }
@@ -523,6 +526,7 @@ async fn udp_task(
 
                 frame_id = frame_id.wrapping_add(1);
                 current_pos = 0;
+                chunk_id = 0;
             }
             CameraMessage::HardwareError => {
                 info!("Camera hardware error reported to UDP task.");
