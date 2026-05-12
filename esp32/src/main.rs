@@ -10,6 +10,7 @@
 #![deny(clippy::large_stack_frames)]
 
 use camera_tcp_server::camera::cam_init;
+use core::ops::Index;
 use core::{str::FromStr};
 
 use embassy_executor::Spawner;
@@ -377,6 +378,8 @@ async fn udp_task(
                     frame_buffer[current_pos..current_pos + length]
                         .copy_from_slice(&buffer[..length]);
                     current_pos += length;
+                } else {
+                    println!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
             }
             CameraMessage::EndOfFrame => {
@@ -384,21 +387,18 @@ async fn udp_task(
                     continue;
                 }
 
-                let total_chunks = (current_pos + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+                let total_chunks = current_pos.div_ceil(MAX_CHUNK_SIZE);
+                let mut chunk_id = 0;
 
-                for i in 0..total_chunks {
-                    let start = i * MAX_CHUNK_SIZE;
-                    let end = (start + MAX_CHUNK_SIZE).min(current_pos);
-                    let chunk_len = end - start;
-
+                for chunk in frame_buffer[..current_pos].chunks(MAX_CHUNK_SIZE) {
                     let mut payload = [0u8; MAX_CHUNK_SIZE];
-                    payload[..chunk_len].copy_from_slice(&frame_buffer[start..end]);
+                    payload[..chunk.len()].copy_from_slice(&chunk);
 
                     let chunk = JpegFrameChunk {
                         frame_id,
-                        chunk_id: i as u8,
+                        chunk_id: chunk_id as u8,
                         total_chunks: total_chunks as u8,
-                        payload_len: chunk_len as u16,
+                        payload_len: chunk.len() as u16,
                         payload,
                     };
 
@@ -407,14 +407,16 @@ async fn udp_task(
                         break;
                     }
 
-                    if i == total_chunks - 1 {
+                    if chunk_id == total_chunks - 1 {
                         println!("Frame {} sent ({} bytes)", frame_id, current_pos);
                     }
-                    
+
+                    chunk_id +=1;
                 }
 
                 frame_id = frame_id.wrapping_add(1);
                 current_pos = 0;
+                chunk_id = 0;
             }
             CameraMessage::HardwareError => {
                 println!("Camera hardware error reported to UDP task.");
