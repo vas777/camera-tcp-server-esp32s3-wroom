@@ -353,6 +353,7 @@ dependencies = [
  "embassy-futures",
  "embassy-time",
  "heapless 0.9.3",
+ "log",
  "num_enum",
  "rand_core 0.9.5",
 ]
