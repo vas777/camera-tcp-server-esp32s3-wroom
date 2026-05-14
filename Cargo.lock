@@ -353,6 +353,7 @@ dependencies = [
  "embassy-futures",
  "embassy-time",
  "heapless 0.9.3",
+ "log",
  "num_enum",
  "rand_core 0.9.5",
 ]
@@ -378,6 +379,7 @@ dependencies = [
  "embassy-net",
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
+ "log",
 ]
 
 [[package]]
