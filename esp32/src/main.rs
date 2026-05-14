@@ -17,6 +17,7 @@ use alloc::vec;
 use camera_tcp_server::camera::cam_init;
 use log::{debug, info, trace};
 use core::ops::Index;
+// use edge_dhcp::io::server;
 
 use embassy_executor::Spawner;
 
@@ -28,7 +29,7 @@ use embassy_net::{
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use esp_alloc::{self as _, HeapStats};
 use esp_backtrace as _;
 use esp_hal::system::Stack as ProcStack;
@@ -145,6 +146,7 @@ impl<T> MyBox<T> {
 }
 
 static STATION_CONNECTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static LAST_CONNECTED_IP: Signal<CriticalSectionRawMutex, Ipv4Addr> = Signal::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -264,11 +266,20 @@ async fn main(spawner: Spawner) -> ! {
     let udp_frame_buffer = mk_static!([u8; 32786], [0u8; 32786]);
     let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
     let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
-    
     let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
-    let udp_tx_payload = mk_static!([u8; 16384], [0u8; 16384]);
+    let udp_tx_payload = mk_static!([u8; 32768], [0u8; 32768]);
 
-    spawner.spawn(udp_task(stack, udp_frame_buffer, udp_rx_meta, udp_rx_payload, udp_tx_meta, udp_tx_payload).expect("Failed to spawn UDP task."));
+    spawner.spawn(
+        udp_task(
+            stack,
+            udp_frame_buffer,
+            udp_rx_meta,
+            udp_rx_payload,
+            udp_tx_meta,
+            udp_tx_payload,
+        )
+        .unwrap(),
+    );
 
     loop {
         if stack.is_link_up() {
@@ -322,17 +333,41 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
         .await
         .expect("Failed to create socket for dhcp.");
 
+    let mut dhcp_server: Server<_, 64> = Server::new(|| embassy_time::Instant::now().as_secs(), ip);
+
+    STATION_CONNECTED.wait().await;
+    STATION_CONNECTED.reset();
+
     loop {
-        _ = io::server::run(
-            &mut Server::<_, 64>::new_with_et(ip),
-            &ServerOptions::new(ip, Some(&mut gw_buf)),
-            &mut bound_socket,
-            &mut dhcp_scratch_buf,
+        // io::server::run never returns, so we wrap it into timeout to be
+        // able to get leased addresses and get our IP of the client
+        let result = with_timeout(
+            Duration::from_secs(2),
+            io::server::run(
+                &mut dhcp_server,
+                &ServerOptions::new(ip, Some(&mut gw_buf)),
+                &mut bound_socket,
+                &mut buf,
+            ),
         )
-        .await
-        .inspect_err(|e| log::warn!("DHCP server error: {e:?}"));
-        // Wait before trying to recreate DHCP server
-        Timer::after(Duration::from_millis(5000)).await;
+        .await;
+
+        match result {
+            Ok(Err(e)) => log::warn!("DHCP server error: {:?}", e),
+            Err(e) => {
+                // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
+                // just assume static client with this IP
+                LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
+                println!("DHCP {e:?}");
+            }
+            _ => {}
+        }
+
+        // stream to the last one connected
+        for (client_ip, _) in dhcp_server.leases.iter() {
+            println!("Leased IP addr: {}", client_ip);
+            LAST_CONNECTED_IP.signal(*client_ip);
+        }
     }
 }
 
@@ -363,7 +398,7 @@ async fn connection(controller: WifiController<'static>) {
             }
             _ => (),
         }
-        Timer::after(Duration::from_millis(5000)).await
+        // Timer::after(Duration::from_millis(5000)).await
     }
 }
 
@@ -449,12 +484,12 @@ enum ConnectionState {
 
 #[embassy_executor::task]
 async fn udp_task(
-    stack: Stack<'static>, 
+    stack: Stack<'static>,
     frame_buffer: &'static mut [u8],
     rx_meta: &'static mut [PacketMetadata; 4],
     rx_payload: &'static mut [u8; 1024],
     tx_meta: &'static mut [PacketMetadata; 20],
-    tx_payload: &'static mut [u8; 16384],
+    tx_payload: &'static mut [u8; 32768],
 ) {
     info!("Start UDP task...");
     let mut socket = UdpSocket::new(
@@ -468,9 +503,11 @@ async fn udp_task(
 
     let mut frame_id: u16 = 0;
     let mut current_pos = 0;
+    let user_ip: Ipv4Addr = LAST_CONNECTED_IP.wait().await;
+    LAST_CONNECTED_IP.reset();
 
-    let remote_endpoint =
-        core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 5000));
+    println!("user ip {user_ip}");
+    let remote_endpoint = core::net::SocketAddr::V4(SocketAddrV4::new(user_ip, 5000));
 
     info!("UDP task waiting for a station to connect...");
     STATION_CONNECTED.wait().await;
@@ -526,7 +563,6 @@ async fn udp_task(
 
                 frame_id = frame_id.wrapping_add(1);
                 current_pos = 0;
-                chunk_id = 0;
             }
             CameraMessage::HardwareError => {
                 info!("Camera hardware error reported to UDP task.");
