@@ -88,11 +88,17 @@ include!(concat!(env!("OUT_DIR"), "/port.rs"));
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 const DEFAULT_GW_IP_ADDR: &str = "192.168.2.1";
 const AP_SSID_NAME: &str = "esp-radio-2";
-const DATA_CHUNK_SIZE: usize = 1480;
-const VIDEO_DATA_POOL_POOL_SIZE: usize = 32;
+const MAX_FRAME_SIZE: usize = 72000;
+const DATA_CHUNK_SIZE: usize = 1024;
+const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
+// both need SRAM but DMA must be static
+const HEAP_SIZE: usize = 200 * 1024 - DMA_RX_STREAM_BUF_SIZE;
+const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
+const TCP_TX_BUFF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
+const VIDEO_DATA_POOL_POOL_SIZE: usize = 42;
 const CAMERA_STACK_SIZE: usize = 2048;
 const MTU: usize = 1500;
-
+const TCP_RX_BUFF_SIZE: usize = 15 * MTU;
 pub enum CameraMessage {
     /// A chunk of video data. Contains the buffer and the number of valid bytes.
     VideoChunk(MyBox<[u8; DATA_CHUNK_SIZE]>, usize),
@@ -104,9 +110,13 @@ pub enum CameraMessage {
     HardwareError,
 }
 
-static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, 32> = Channel::new();
-static VIDEO_DATA_POOL: Channel<CriticalSectionRawMutex, MyBox<[u8; DATA_CHUNK_SIZE]>, 32> =
+static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, VIDEO_DATA_POOL_POOL_SIZE> =
     Channel::new();
+static VIDEO_DATA_POOL: Channel<
+    CriticalSectionRawMutex,
+    MyBox<[u8; DATA_CHUNK_SIZE]>,
+    VIDEO_DATA_POOL_POOL_SIZE,
+> = Channel::new();
 
 struct MyBox<T>(Box<T>);
 
@@ -135,7 +145,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // - `reclaimed`: Memory reclaimed from the esp-idf bootloader.
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 100 * 1024);
+    esp_alloc::heap_allocator!(size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -212,6 +222,7 @@ async fn main(spawner: Spawner) -> ! {
     // this way we can achieve zero-copy streaming from camera to browser with backpressure
     // support (when network is congested the camera task will wait for an available buffer
     // instead of busy-looping and dropping frames)
+    info!("POOL size {VIDEO_DATA_POOL_POOL_SIZE}");
     for _ in 0..VIDEO_DATA_POOL_POOL_SIZE {
         VIDEO_DATA_POOL.send(MyBox::new([0; DATA_CHUNK_SIZE])).await;
     }
@@ -346,7 +357,7 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
 #[embassy_executor::task]
 async fn camera_task(camera: Camera<'static>) {
     // TODO with embassy this got smaller why ?
-    let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(32 * DATA_CHUNK_SIZE, DATA_CHUNK_SIZE);
+    let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(DMA_RX_STREAM_BUF_SIZE, DATA_CHUNK_SIZE);
     let mut transfer: esp_hal::lcd_cam::cam::CameraTransfer<'_, esp_hal::dma::DmaRxStreamBuf> =
         camera
             .receive(dma_rx_buf)
@@ -427,8 +438,8 @@ async fn tcp_task(stack: Stack<'static>) {
     // enough to accommodate jpeg frame size of
     // decent quality (quality is set by (0x4407, 0x4))
     // in camera_config.rs (lower is better)
-    let mut rx_buffer = vec![0; 6 * MTU].into_boxed_slice();
-    let mut tx_buffer = vec![0; 32 * DATA_CHUNK_SIZE].into_boxed_slice();
+    let mut rx_buffer = vec![0; TCP_RX_BUFF_SIZE].into_boxed_slice();
+    let mut tx_buffer = vec![0; TCP_TX_BUFF_SIZE].into_boxed_slice();
 
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
