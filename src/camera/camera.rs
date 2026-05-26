@@ -6,7 +6,7 @@ use esp_hal::{
     i2c::master::{Config, I2c},
     lcd_cam::{
         LcdCam,
-        cam::{self, Camera, Config as CamConfig, ConfigError},
+        cam::{Camera, Config as CamConfig, ConfigError},
     },
     peripherals::{DMA_CH0, I2C0, LCD_CAM},
     peripherals::{

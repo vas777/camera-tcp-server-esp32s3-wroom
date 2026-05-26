@@ -1,7 +1,24 @@
+use std::path::Path;
+
 fn main() {
     linker_be_nice();
+    read_env();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+    println!("cargo:rerun-if-env-changed=DEFAULT_PORT");
+}
+
+fn read_env() {
+    use std::str::FromStr;
+    let p = std::env::var("DEFAULT_PORT").unwrap_or("8080".to_owned());
+    let port = u16::from_str(&p).unwrap();
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let port_rs = Path::new(&out_dir).join("port.rs");
+    std::fs::write(
+        port_rs,
+        format!("pub const DEFAULT_PORT_ENV: u16 = {};", port),
+    )
+    .unwrap();
 }
 
 fn linker_be_nice() {

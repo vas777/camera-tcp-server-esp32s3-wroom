@@ -9,31 +9,134 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use camera_tcp_server::{camera::cam_init, wifi::init_wifi_stack};
-use embedded_io::*;
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec;
+
+use camera_tcp_server::camera::cam_init;
+use core::{net::Ipv4Addr, str::FromStr};
+use log::{debug, info, trace};
+
+use embassy_executor::Spawner;
+
+use embassy_futures::yield_now;
+use embassy_net::{
+    IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket,
+};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::system::Stack as ProcStack;
 use esp_hal::{
-    clock::CpuClock,
-    dma_rx_stream_buffer, main, ram,
-    time::{self, Duration},
-    timer::timg::TimerGroup,
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, lcd_cam::cam::Camera, ram,
+    rng::Rng, timer::timg::TimerGroup,
 };
-use esp_println::{print, println};
+use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, ap::AccessPointConfig};
+use esp_rtos::embassy::Executor;
+esp_bootloader_esp_idf::esp_app_desc!();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
-esp_bootloader_esp_idf::esp_app_desc!();
 
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
-#[main]
-fn main() -> ! {
+
+// When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
+
+// TODO: decide either this parsing or build.rs
+// const fn parse_u16(s: &str) -> u16 {
+//     let mut res: u16 = 0;
+//     let mut i = 0;
+//     let bytes = s.as_bytes();
+//     while i < bytes.len() {
+//         assert!(bytes[i] >= b'0' && bytes[i] <= b'9', "Error: Invalid port");
+//         let digit = (bytes[i] - b'0') as u16;
+
+//         let multiplied = match res.checked_mul(10) {
+//             Some(v) => v,
+//             None => panic!("Error: Port value exceeds u16::MAX (65535)"),
+//         };
+
+//         res = match multiplied.checked_add(digit) {
+//             Some(v) => v,
+//             None => panic!("Error: Port value exceeds u16::MAX (65535)"),
+//         };
+//         i += 1;
+//     }
+//     res
+// }
+
+// const DEFAULT_PORT_ENV: u16 = match option_env!("DEFAULT_PORT") {
+//     Some(p) => parse_u16(p),
+//     None => DEFAULT_PORT,
+// };
+
+include!(concat!(env!("OUT_DIR"), "/port.rs"));
+const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
+const DEFAULT_GW_IP_ADDR: &str = "192.168.2.1";
+const AP_SSID_NAME: &str = "esp-radio-2";
+const MAX_FRAME_SIZE: usize = 72000;
+const DATA_CHUNK_SIZE: usize = 1024;
+const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
+// both need SRAM but DMA must be static
+const HEAP_SIZE: usize = 200 * 1024 - DMA_RX_STREAM_BUF_SIZE;
+const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
+const TCP_TX_BUFF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
+const VIDEO_DATA_POOL_POOL_SIZE: usize = 42;
+const CAMERA_STACK_SIZE: usize = 2048;
+const MTU: usize = 1500;
+const TCP_RX_BUFF_SIZE: usize = 15 * MTU;
+pub enum CameraMessage {
+    /// A chunk of video data. Contains the buffer and the number of valid bytes.
+    VideoChunk(MyBox<[u8; DATA_CHUNK_SIZE]>, usize),
+
+    /// Signal that the JPEG frame is completely finished
+    EndOfFrame,
+
+    /// Optional: Signal that the hardware crashed and needs a reset
+    HardwareError,
+}
+
+static VIDEO_CHANNEL: Channel<CriticalSectionRawMutex, CameraMessage, VIDEO_DATA_POOL_POOL_SIZE> =
+    Channel::new();
+static VIDEO_DATA_POOL: Channel<
+    CriticalSectionRawMutex,
+    MyBox<[u8; DATA_CHUNK_SIZE]>,
+    VIDEO_DATA_POOL_POOL_SIZE,
+> = Channel::new();
+
+struct MyBox<T>(Box<T>);
+
+impl<T> Drop for MyBox<T> {
+    fn drop(&mut self) {
+        info!("MyBox is being dropped, cleaning up resources.");
+    }
+}
+
+impl<T> MyBox<T> {
+    pub fn new(val: T) -> Self {
+        MyBox(Box::new(val))
+    }
+}
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
     // TODO :why?
     // DEBUG - failed to transmit IP: device exhausted
-    esp_println::logger::init_logger(log::LevelFilter::Error);
+    esp_println::logger::init_logger(log::LevelFilter::Debug);
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     // all peripherals are `generated` at compile time as singletons
     // peripherals.WIFI
@@ -42,9 +145,10 @@ fn main() -> ! {
 
     // - `reclaimed`: Memory reclaimed from the esp-idf bootloader.
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 36 * 1024);
+    esp_alloc::heap_allocator!(size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
     // An RTOS (Real-Time Operating System) implementation for esp-hal
     //
@@ -56,17 +160,41 @@ fn main() -> ! {
     // HERE interrupts are enabled
     // This transition is necessary because an RTOS relies entirely
     // on interrupt-driven preemptions to pause your main code
-    esp_rtos::start(timg0.timer0);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // controller must be preserved
-    let (ap_stack, controller) = init_wifi_stack(peripherals.WIFI);
+    let access_point_config =
+        Config::AccessPoint(AccessPointConfig::default().with_ssid(AP_SSID_NAME));
 
-    println!(
-        "Start busy loop on main. Connect to the AP `esp-radio` and point your browser to http://192.168.2.1:8080/"
+    let (controller, interfaces) = esp_radio::wifi::new(
+        peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(access_point_config),
+    )
+    .expect("Failed to initialize WiFi");
+
+    info!("Wifi started!");
+
+    let device = interfaces.access_point;
+
+    let gw_ip_addr_str = GW_IP_ADDR_ENV.unwrap_or(DEFAULT_GW_IP_ADDR);
+    let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
+
+    let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(gw_ip_addr, 24),
+        gateway: Some(gw_ip_addr),
+        dns_servers: Default::default(),
+    });
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+    // Init network stack
+    let (stack, runner) = embassy_net::new(
+        device,
+        config,
+        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        seed,
     );
-    println!("Use a static IP in the range 192.168.2.2 .. 192.168.2.255, use gateway 192.168.2.1");
-    // check for HTTP headers
-    // .arduino15/packages/esp32/hardware/esp32/3.3.7/libraries/ESP32/examples/Camera/CameraWebServer/app_httpd.cpp
+
     let camera = cam_init(
         peripherals.LCD_CAM,
         peripherals.DMA_CH0,
@@ -86,165 +214,368 @@ fn main() -> ! {
         peripherals.GPIO17,
         peripherals.GPIO16,
     )
-    .unwrap();
+    .expect("Failed to initialize camera");
 
-    // 9. Create sockets with stacks
-    let mut rx_buffer = [0u8; 1536];
-    // TX must be massive to act as a shock-absorber between the fast camera and slow Wi-Fi
-    // 16KB to 32KB is highly recommended for MJPEG streaming.
-    let mut tx_buffer = [0u8; 65536];
-    let mut ap_socket = ap_stack.get_socket(&mut rx_buffer, &mut tx_buffer);
+    // to prevent unnecessary allocations and copying of buffers we create pool of buffers
+    // for camera to write into and then send them to tcp task for writing to socket;
+    // after writing to socket the buffer is returned back to pool;
+    // this way we can achieve zero-copy streaming from camera to browser with backpressure
+    // support (when network is congested the camera task will wait for an available buffer
+    // instead of busy-looping and dropping frames)
+    info!("POOL size {VIDEO_DATA_POOL_POOL_SIZE}");
+    for _ in 0..VIDEO_DATA_POOL_POOL_SIZE {
+        VIDEO_DATA_POOL.send(MyBox::new([0; DATA_CHUNK_SIZE])).await;
+    }
 
-    let dma_rx_buf = dma_rx_stream_buffer!(160 * 1000);
-    let mut transfer = camera.receive(dma_rx_buf).map_err(|e| e.0).unwrap();
+    let app_core_stack = mk_static!(ProcStack<CAMERA_STACK_SIZE>, ProcStack::new());
+    esp_rtos::start_second_core(
+        peripherals.CPU_CTRL,
+        sw_int.software_interrupt1,
+        app_core_stack,
+        move || {
+            static EXECUTOR: static_cell::StaticCell<Executor> = static_cell::StaticCell::new();
+            let executor = EXECUTOR.init(Executor::new());
+            executor.run(|spawner| {
+                spawner.spawn(camera_task(camera).expect("Failed to spawn camera"));
+            });
+        },
+    );
 
-    ap_socket.listen(8080).unwrap();
+    spawner.spawn(connection(controller).expect("Failed to spawn wifi controller."));
+    // advances network stack
+    spawner.spawn(net_task(runner).expect("Failed to spawn network task."));
+    spawner.spawn(run_dhcp(stack, gw_ip_addr_str).expect("Failed to spawn dhcp."));
+    spawner.spawn(tcp_task(stack).expect("Failed to spawn tcp task."));
 
     loop {
-        ap_socket.work();
-
-        if !ap_socket.is_open() {
-            ap_socket.listen(8080).unwrap();
+        if stack.is_link_up() {
+            break;
         }
+        Timer::after(Duration::from_millis(500)).await;
+    }
 
-        // 11. Did someone connected ?
-        if !ap_socket.is_connected() {
+    info!(
+        "Connect to the AP: {AP_SSID_NAME} and point your browser to http://{gw_ip_addr_str}:{DEFAULT_PORT_ENV}/"
+    );
+    info!("DHCP is enabled so there's no need to configure a static IP, just in case:");
+    while !stack.is_config_up() {
+        Timer::after(Duration::from_millis(100)).await
+    }
+    stack.config_v4().inspect(|c| info!("ipv4 config: {c:?}"));
+
+    let stats: esp_alloc::HeapStats = esp_alloc::HEAP.stats();
+    info!("{}", stats);
+
+    loop {
+        core::future::pending::<()>().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
+    use core::net::{Ipv4Addr, SocketAddrV4};
+
+    use edge_dhcp::{
+        io::{self, DEFAULT_SERVER_PORT},
+        server::{Server, ServerOptions},
+    };
+    use edge_nal::UdpBind;
+    use edge_nal_embassy::{Udp, UdpBuffers};
+
+    let ip = Ipv4Addr::from_str(gw_ip_addr).expect("dhcp task failed to parse gw ip");
+
+    const RX_UDP_BUF_SIZE: usize = 1024;
+    const TX_UDP_BUF_SIZE: usize = RX_UDP_BUF_SIZE;
+    const DHCP_BUF_SIZE: usize = TX_UDP_BUF_SIZE;
+    const NUMBER_OF_BUFFERS: usize = 2;
+    const PACKETS_PER_BUFFER: usize = 2;
+    let mut dhcp_scratch_buf = vec![0u8; DHCP_BUF_SIZE].into_boxed_slice();
+
+    let mut gw_buf = [Ipv4Addr::UNSPECIFIED];
+
+    let buffers =
+        UdpBuffers::<NUMBER_OF_BUFFERS, RX_UDP_BUF_SIZE, TX_UDP_BUF_SIZE, PACKETS_PER_BUFFER>::new(
+        );
+    let unbound_socket = Udp::new(stack, &buffers);
+    let mut bound_socket = unbound_socket
+        .bind(core::net::SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            DEFAULT_SERVER_PORT,
+        )))
+        .await
+        .expect("Failed to create socket for dhcp.");
+
+    loop {
+        _ = io::server::run(
+            &mut Server::<_, 64>::new_with_et(ip),
+            &ServerOptions::new(ip, Some(&mut gw_buf)),
+            &mut bound_socket,
+            &mut dhcp_scratch_buf,
+        )
+        .await
+        .inspect_err(|e| log::warn!("DHCP server error: {e:?}"));
+        // Wait before trying to recreate DHCP server
+        Timer::after(Duration::from_millis(5000)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(controller: WifiController<'static>) {
+    info!("start connection task");
+    loop {
+        let ev = controller
+            .wait_for_access_point_connected_event_async()
+            .await;
+        match ev {
+            Ok(esp_radio::wifi::AccessPointStationEventInfo::Connected(
+                access_point_station_connected_info,
+            )) => {
+                info!(
+                    "Station connected: {:?}",
+                    access_point_station_connected_info
+                );
+            }
+            Ok(esp_radio::wifi::AccessPointStationEventInfo::Disconnected(
+                access_point_station_disconnected_info,
+            )) => {
+                info!(
+                    "Station disconnected: {:?}",
+                    access_point_station_disconnected_info
+                );
+            }
+            _ => (),
+        }
+        Timer::after(Duration::from_millis(5000)).await
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn camera_task(camera: Camera<'static>) {
+    // TODO with embassy this got smaller why ?
+    let dma_rx_buf = esp_hal::dma_rx_stream_buffer!(DMA_RX_STREAM_BUF_SIZE, DATA_CHUNK_SIZE);
+    let mut transfer: esp_hal::lcd_cam::cam::CameraTransfer<'_, esp_hal::dma::DmaRxStreamBuf> =
+        camera
+            .receive(dma_rx_buf)
+            .map_err(|e| e.0)
+            .expect("Failed to receive from camera");
+
+    info!("Started camera");
+    loop {
+        // must scope the borrowed data buffer
+        // use it within scope for sending to channel
+        let (bytes_to_consume, eof_reached, is_done) = {
+            let (data, ends_with_eof) = transfer.peek_until_eof();
+
+            if data.is_empty() {
+                // No data yet, return early to drop the borrow
+                // info!("data.is_empty()");
+                (0, ends_with_eof, transfer.is_done())
+            } else {
+                for chunk in data.chunks(DATA_CHUNK_SIZE) {
+                    let mut scratch_buf = VIDEO_DATA_POOL.receive().await;
+                    scratch_buf.0[..chunk.len()].copy_from_slice(chunk);
+
+                    // Use .send(...).await to provide backpressure and ensure frame integrity.
+                    // This prevents the task from busy-looping when the network is congested
+                    // and ensures the browser doesn't receive partial/corrupted JPEGs.
+                    VIDEO_CHANNEL
+                        .send(CameraMessage::VideoChunk(scratch_buf, chunk.len()))
+                        .await;
+                }
+
+                (data.len(), ends_with_eof, transfer.is_done())
+            }
+        };
+
+        if bytes_to_consume > 0 {
+            transfer.consume(bytes_to_consume);
+        } else {
+            // If we had no data to consume, check if the transfer finished.
+            if is_done {
+                info!("camera's DMA is full - resetting it");
+                let (camera, returned_buf) = transfer.stop();
+                transfer = camera
+                    .receive(returned_buf)
+                    .map_err(|e| e.0)
+                    .expect("Failed to reinitialize camera");
+                VIDEO_CHANNEL.send(CameraMessage::EndOfFrame).await;
+            }
+
+            // nothing to consume
+            // good time to yield
+            // TODO: even with second core we still needs this
+            // read about WFI - Wait For Interrupt instruction;
+            // Task Watchdog Timer (TWDT)
+            // https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/wdts.html
+            yield_now().await;
             continue;
         }
 
-        println!("Connected");
+        if eof_reached {
+            VIDEO_CHANNEL.send(CameraMessage::EndOfFrame).await;
+            yield_now().await;
+        }
+    }
+}
 
-        let deadline = time::Instant::now() + Duration::from_secs(20);
-        // TODO: is 1024 magic number or requirment here ?
-        let mut buffer = [0u8; 1024];
-        let mut pos = 0;
-        loop {
-            if let Ok(len) = ap_socket.read(&mut buffer[pos..]) {
-                let to_print = unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+#[derive(Eq, PartialEq)]
+enum ConnectionState {
+    GetNextRequest,
+    StartStream,
+}
 
-                if to_print.contains("\r\n\r\n") {
-                    print!("{}", to_print);
-                    println!();
+#[embassy_executor::task]
+async fn tcp_task(stack: Stack<'static>) {
+    info!("Start tcp task...");
+    // debug log message RX is full trying 6*MTU
+    // mostly fixed that
+    // tx should be be `big`
+    // enough to accommodate jpeg frame size of
+    // decent quality (quality is set by (0x4407, 0x4))
+    // in camera_config.rs (lower is better)
+    let mut rx_buffer = vec![0; TCP_RX_BUFF_SIZE].into_boxed_slice();
+    let mut tx_buffer = vec![0; TCP_TX_BUFF_SIZE].into_boxed_slice();
 
-                    if to_print.contains("GET /favicon.ico") {
-                        let _ = ap_socket
-                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-                        let _ = ap_socket.flush();
-                        ap_socket.close();
-                        continue;
+    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+
+    loop {
+        info!("Wait for connection...");
+        let r = socket
+            .accept(IpListenEndpoint {
+                addr: None,
+                port: DEFAULT_PORT_ENV,
+            })
+            .await;
+        info!("Connected...");
+
+        if let Err(e) = r {
+            info!("connect error: {:?}", e);
+            continue;
+        }
+
+        if connect_to_browser(&mut socket).await == ConnectionState::GetNextRequest {
+            continue;
+        }
+        stream_frames(&mut socket).await;
+    }
+}
+
+async fn connect_to_browser(socket: &mut TcpSocket<'_>) -> ConnectionState {
+    // just in case MTU size
+    let mut scratch_buffer = vec![0u8; MTU].into_boxed_slice();
+    let mut pos = 0;
+    loop {
+        match socket.read(&mut scratch_buffer[pos..]).await {
+            Ok(0) => {
+                info!("read EOF");
+                socket.close();
+                let _ = socket.flush().await;
+                return ConnectionState::GetNextRequest;
+            }
+
+            Ok(len) => {
+                let request =
+                    unsafe { core::str::from_utf8_unchecked(&scratch_buffer[..(pos + len)]) };
+
+                if request.contains("\r\n\r\n") {
+                    info!("{}", request);
+
+                    if request.contains("GET /favicon.ico") {
+                        let _ = socket
+                                .write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                        socket.abort();
+                        return ConnectionState::GetNextRequest;
                     }
 
-                    if to_print.contains("GET / HTTP/1.1") {
-                        println!("Serving HTML Dashboard");
-                        let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-                        let _ = ap_socket.write_all(header);
-                        // Notice we changed the HTML image src inside here to point to "/stream"
-                        let html_page = include_str!("../dashboard.txt");
-                        let _ = ap_socket.write_all(html_page.as_bytes());
-                        let _ = ap_socket.flush();
-                        ap_socket.close();
-                        continue; // Wait for the browser to reconnect and ask for /stream
+                    if request.contains("GET / HTTP/1.1") {
+                        info!("Serving HTML Dashboard");
+                        let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n";
+                        let _ = socket.write(header).await;
+                        let html_page = include_str!("../dashboard.html");
+                        let _ = socket.write(html_page.as_bytes()).await;
+                        socket.close();
+                        let _ = socket.flush().await;
+
+                        // Wait for the browser to reconnect and ask for /stream
+                        return ConnectionState::GetNextRequest;
                     }
 
-                    if to_print.contains("GET /stream HTTP/1.1") {
-                        println!("Browser requested the video stream!");
-                        break;
+                    if request.contains("GET /stream HTTP/1.1") {
+                        info!("Browser requested the video stream!");
+                        let header =
+        b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+
+                        if socket.write(header).await.is_err() {
+                            info!("Client dropped before header was sent.");
+                            socket.close();
+                            let _ = socket.flush().await;
+                            return ConnectionState::GetNextRequest;
+                        }
+
+                        debug!("Header was sent.");
+                        let _ = socket.flush().await;
+
+                        return ConnectionState::StartStream;
                     }
 
                     // If it's anything else, close it
-                    ap_socket.close();
-                    continue;
+                    socket.close();
+                    let _ = socket.flush().await;
+                    return ConnectionState::GetNextRequest;
                 }
 
+                // not the end of request
                 pos += len;
-            } else {
-                break;
             }
-
-            if time::Instant::now() > deadline {
-                println!("Timeout");
-                break;
+            Err(e) => {
+                info!("read error: {:?}", e);
+                socket.close();
+                return ConnectionState::GetNextRequest;
             }
         }
+    }
+}
 
-        println!("Client connected! Starting video stream.");
+async fn stream_frames(socket: &mut TcpSocket<'_>) {
+    info!("Starting video stream.");
+    loop {
+        match VIDEO_CHANNEL.receive().await {
+            CameraMessage::VideoChunk(scratch_buffer, length) => {
+                trace!("CameraMessage::VideoChunk {}", length);
+                let write_result = socket.write(&scratch_buffer.0[..length]).await;
 
-        // in case of reaload remove remaining bytes from DMA buffer
-        let (camera, returned_buf) = transfer.stop();
-        transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
+                // Always return the buffer to the pool to prevent depletion,
+                // even if the socket write failed.
+                VIDEO_DATA_POOL.send(scratch_buffer).await;
 
-        // send once per connection Main HTTP Header
-        let header =
-            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        if ap_socket.write_all(header).is_err() {
-            println!("Client dropped before header was sent.");
-            ap_socket.close();
-            continue;
-        }
-        // println!("Header was sent.");
-        ap_socket.flush().unwrap_or_default();
-
-        // 12. Let's send our video feed
-        // break this loop if somethig with socket
-        // like reload/repeated request of the page
-        'start_new_stream: loop {
-            // send once per frame Boundary Header
-            let frame_header = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-            if ap_socket.write_all(frame_header).is_err() {
-                break 'start_new_stream;
-            }
-            ap_socket.flush().unwrap_or_default();
-            // println!("Frame boundary was sent.");
-            let mut jpeg_total_bytes = 0;
-
-            // Reads the DMA chunks until EOF for this specific frame
-            loop {
-                let (data, ends_with_eof) = transfer.peek_until_eof();
-
-                if data.is_empty() {
-                    if transfer.is_done() {
-                        println!("Network lag detected. Dropping frame...");
-                        let (camera, returned_buf) = transfer.stop();
-                        transfer = camera.receive(returned_buf).map_err(|e| e.0).unwrap();
-                        break;
-                    }
-                    // good time advance network
-                    ap_socket.work();
-                    continue;
-                }
-
-                let bytes_peeked = data.len();
-                jpeg_total_bytes += bytes_peeked;
-
-                // Stream the binary image chunks
-                for chunk in data.chunks(1460) {
-                    if let Err(_) = ap_socket.write_all(chunk) {
-                        transfer.consume(bytes_peeked);
-                        break 'start_new_stream;
-                    }
-                }
-
-                // Free the DMA buffer
-                transfer.consume(bytes_peeked);
-
-                // If this chunk contained the EOF signal, the frame is complete
-                if ends_with_eof {
-                    // println!("Frame sent. Total bytes: {}", jpeg_total_bytes);
-
-                    // Close the frame payload with a carriage return
-                    if ap_socket.write_all(b"\r\n").is_err() || ap_socket.flush().is_err() {
-                        break 'start_new_stream;
-                    }
-                    // Break out of the DMA loop.
-                    // println!("Frame was sent.");
+                if write_result.is_err() {
                     break;
                 }
-            } // DMA Loop
-        } // frames Loop
+            }
+            CameraMessage::EndOfFrame => {
+                // info!("CameraMessage::EndOfFrame");
+                let boundary = b"\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+                if socket.write(boundary).await.is_err() {
+                    break;
+                }
+                let _ = socket.flush().await;
+            }
+            CameraMessage::HardwareError => {
+                info!("Camera died, closing connection to force client refresh.");
+                break;
+            }
+        }
+    }
 
-        ap_socket.close();
-
-        println!("Done\n");
-        println!();
-    } // Start the stream loop
+    let _ = socket.write(b"\r\n").await;
+    socket.close();
+    let _ = socket.flush().await;
+    info!("Done streaming!");
 }
