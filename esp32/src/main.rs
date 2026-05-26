@@ -107,11 +107,9 @@ const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
 // both need SRAM but DMA must be static
 const HEAP_SIZE: usize = 100 * 1024 - DMA_RX_STREAM_BUF_SIZE;
 const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
-const TCP_TX_BUFF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
 const VIDEO_DATA_POOL_POOL_SIZE: usize = 16;
 const CAMERA_STACK_SIZE: usize = 2048;
 const MTU: usize = 1500;
-const TCP_RX_BUFF_SIZE: usize = 15 * MTU;
 pub enum CameraMessage {
     /// A chunk of video data. Contains the buffer and the number of valid bytes.
     VideoChunk(MyBox<[u8; DATA_CHUNK_SIZE]>, usize),
@@ -296,7 +294,7 @@ async fn main(spawner: Spawner) -> ! {
 
     stack
         .config_v4()
-        .inspect(|c| println!("ipv4 config: {c:?}"));
+        .inspect(|c| info!("ipv4 config: {c:?}"));
 
     let stats: HeapStats = esp_alloc::HEAP.stats();
     // HeapStats implements the Display and defmt::Format traits, so you can
@@ -347,7 +345,7 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
                 &mut dhcp_server,
                 &ServerOptions::new(ip, Some(&mut gw_buf)),
                 &mut bound_socket,
-                &mut buf,
+                &mut dhcp_scratch_buf,
             ),
         )
         .await;
@@ -358,14 +356,14 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
                 // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
                 // just assume static client with this IP
                 LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
-                println!("DHCP {e:?}");
+                info!("DHCP {e:?}");
             }
             _ => {}
         }
 
         // stream to the last one connected
         for (client_ip, _) in dhcp_server.leases.iter() {
-            println!("Leased IP addr: {}", client_ip);
+            info!("Leased IP addr: {}", client_ip);
             LAST_CONNECTED_IP.signal(*client_ip);
         }
     }
@@ -476,12 +474,6 @@ async fn camera_task(camera: Camera<'static>) {
     }
 }
 
-#[derive(Eq, PartialEq)]
-enum ConnectionState {
-    GetNextRequest,
-    StartStream,
-}
-
 #[embassy_executor::task]
 async fn udp_task(
     stack: Stack<'static>,
@@ -506,7 +498,7 @@ async fn udp_task(
     let user_ip: Ipv4Addr = LAST_CONNECTED_IP.wait().await;
     LAST_CONNECTED_IP.reset();
 
-    println!("user ip {user_ip}");
+    info!("user ip {user_ip}");
     let remote_endpoint = core::net::SocketAddr::V4(SocketAddrV4::new(user_ip, 5000));
 
     info!("UDP task waiting for a station to connect...");
@@ -525,7 +517,7 @@ async fn udp_task(
                         .copy_from_slice(&buffer.0[..length]);
                     current_pos += length;
                 } else {
-                    println!("JPEG frame is too big for buffer {}", frame_buffer.len());
+                    info!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
 
             }
