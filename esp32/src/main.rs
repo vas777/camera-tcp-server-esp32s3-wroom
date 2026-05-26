@@ -13,20 +13,22 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::rc::Rc;
 
 use camera_tcp_server::camera::cam_init;
-use log::{debug, info, trace};
 use core::ops::Index;
+use log::{debug, info, trace};
 // use edge_dhcp::io::server;
 
 use embassy_executor::Spawner;
 
-use core::{net::{Ipv4Addr,SocketAddrV4}, str::FromStr};
+use core::{
+    net::{Ipv4Addr, SocketAddrV4},
+    str::FromStr,
+};
 use embassy_futures::yield_now;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{
-    IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
-};
+use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer, with_timeout};
@@ -101,17 +103,15 @@ include!(concat!(env!("OUT_DIR"), "/port.rs"));
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 const DEFAULT_GW_IP_ADDR: &str = "192.168.2.1";
 const AP_SSID_NAME: &str = "esp-radio-2";
-const MAX_FRAME_SIZE: usize = 32768;
-const DATA_CHUNK_SIZE: usize = 1024;
+const MAX_FRAME_SIZE: usize = 65_536; // 64KB is max JPEG size, but we need some extra space for metadata and headers
+const DATA_CHUNK_SIZE: usize = 1400;
 const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
 // both need SRAM but DMA must be static
 const HEAP_SIZE: usize = 100 * 1024 - DMA_RX_STREAM_BUF_SIZE;
 const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
-const TCP_TX_BUFF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
-const VIDEO_DATA_POOL_POOL_SIZE: usize = 16;
+const VIDEO_DATA_POOL_POOL_SIZE: usize = 32;
 const CAMERA_STACK_SIZE: usize = 2048;
 const MTU: usize = 1500;
-const TCP_RX_BUFF_SIZE: usize = 15 * MTU;
 pub enum CameraMessage {
     /// A chunk of video data. Contains the buffer and the number of valid bytes.
     VideoChunk(MyBox<[u8; DATA_CHUNK_SIZE]>, usize),
@@ -152,7 +152,7 @@ static LAST_CONNECTED_IP: Signal<CriticalSectionRawMutex, Ipv4Addr> = Signal::ne
 async fn main(spawner: Spawner) -> ! {
     // TODO :why?
     // DEBUG - failed to transmit IP: device exhausted
-    esp_println::logger::init_logger(log::LevelFilter::Debug);
+    esp_println::logger::init_logger(log::LevelFilter::Info);
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     // all peripherals are `generated` at compile time as singletons
     // peripherals.WIFI
@@ -186,6 +186,8 @@ async fn main(spawner: Spawner) -> ! {
         ControllerConfig::default().with_initial_config(access_point_config),
     )
     .expect("Failed to initialize WiFi");
+
+    let owned_controller = Rc::new(controller);
 
     info!("Wifi started!");
 
@@ -257,13 +259,14 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
-    spawner.spawn(connection(controller).expect("Failed to spawn wifi controller."));
+    spawner.spawn(connection(Rc::clone(&owned_controller)).expect("Failed to spawn wifi controller."));
+    spawner.spawn(rssi_task(Rc::clone(&owned_controller)).expect("Failed to spawn RSSI task."));
     // advances network stack
     spawner.spawn(net_task(runner).expect("Failed to spawn network task."));
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).expect("Failed to spawn dhcp."));
 
     // Optimized buffers for SVGA streaming
-    let udp_frame_buffer = mk_static!([u8; 32786], [0u8; 32786]);
+    let udp_frame_buffer = mk_static!([u8; DMA_RX_STREAM_BUF_SIZE], [0u8; DMA_RX_STREAM_BUF_SIZE]);
     let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
     let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
     let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
@@ -294,9 +297,7 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(100)).await
     }
 
-    stack
-        .config_v4()
-        .inspect(|c| println!("ipv4 config: {c:?}"));
+    stack.config_v4().inspect(|c| info!("ipv4 config: {c:?}"));
 
     let stats: HeapStats = esp_alloc::HEAP.stats();
     // HeapStats implements the Display and defmt::Format traits, so you can
@@ -334,20 +335,17 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
         .expect("Failed to create socket for dhcp.");
 
     let mut dhcp_server: Server<_, 64> = Server::new(|| embassy_time::Instant::now().as_secs(), ip);
-
-    STATION_CONNECTED.wait().await;
-    STATION_CONNECTED.reset();
-
+    let mut timeout_seconds = 10;
     loop {
         // io::server::run never returns, so we wrap it into timeout to be
         // able to get leased addresses and get our IP of the client
         let result = with_timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(timeout_seconds),
             io::server::run(
                 &mut dhcp_server,
                 &ServerOptions::new(ip, Some(&mut gw_buf)),
                 &mut bound_socket,
-                &mut buf,
+                &mut dhcp_scratch_buf,
             ),
         )
         .await;
@@ -358,21 +356,38 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
                 // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
                 // just assume static client with this IP
                 LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
-                println!("DHCP {e:?}");
+                // debug!("DHCP {e:?}");
             }
             _ => {}
         }
 
         // stream to the last one connected
         for (client_ip, _) in dhcp_server.leases.iter() {
-            println!("Leased IP addr: {}", client_ip);
+            // debug!("Leased IP addr: {}", client_ip);
             LAST_CONNECTED_IP.signal(*client_ip);
         }
+        timeout_seconds = 600;
     }
 }
 
 #[embassy_executor::task]
-async fn connection(controller: WifiController<'static>) {
+async fn rssi_task(controller: Rc<WifiController<'static>>) {
+    loop {
+        match controller.rssi(){
+            Ok(rssi) => {
+                // info!("Current RSSI: {} dBm", rssi);
+
+            },
+            Err(e) => {
+                // debug!("RSSI error : {e}");
+            }
+        }
+        Timer::after(Duration::from_secs(5)).await
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(controller: Rc<WifiController<'static>>) {
     info!("start connection task");
     loop {
         let ev = controller
@@ -431,16 +446,17 @@ async fn camera_task(camera: Camera<'static>) {
             } else {
                 for chunk in data.chunks(DATA_CHUNK_SIZE) {
                     let mut scratch_buf = VIDEO_DATA_POOL.receive().await;
+                    debug!("got chunk of data pool");
                     scratch_buf.0[..chunk.len()].copy_from_slice(chunk);
 
                     // Use .send(...).await to provide backpressure and ensure frame integrity.
                     // This prevents the task from busy-looping when the network is congested
                     // and ensures the browser doesn't receive partial/corrupted JPEGs.
+                    debug!("sending data vin VIDEO_CHANNEL");
                     VIDEO_CHANNEL
                         .send(CameraMessage::VideoChunk(scratch_buf, chunk.len()))
                         .await;
                 }
-
                 (data.len(), ends_with_eof, transfer.is_done())
             }
         };
@@ -476,12 +492,6 @@ async fn camera_task(camera: Camera<'static>) {
     }
 }
 
-#[derive(Eq, PartialEq)]
-enum ConnectionState {
-    GetNextRequest,
-    StartStream,
-}
-
 #[embassy_executor::task]
 async fn udp_task(
     stack: Stack<'static>,
@@ -492,13 +502,7 @@ async fn udp_task(
     tx_payload: &'static mut [u8; 32768],
 ) {
     info!("Start UDP task...");
-    let mut socket = UdpSocket::new(
-        stack,
-        rx_meta,
-        rx_payload,
-        tx_meta,
-        tx_payload,
-    );
+    let mut socket = UdpSocket::new(stack, rx_meta, rx_payload, tx_meta, tx_payload);
     socket.bind(DEFAULT_PORT_ENV).unwrap();
 
     let mut frame_id: u16 = 0;
@@ -506,18 +510,19 @@ async fn udp_task(
     let user_ip: Ipv4Addr = LAST_CONNECTED_IP.wait().await;
     LAST_CONNECTED_IP.reset();
 
-    println!("user ip {user_ip}");
+    info!("user ip {user_ip}");
     let remote_endpoint = core::net::SocketAddr::V4(SocketAddrV4::new(user_ip, 5000));
 
     info!("UDP task waiting for a station to connect...");
     STATION_CONNECTED.wait().await;
     STATION_CONNECTED.reset();
-    
+
     // Give the station a moment to initialize its network interface after connecting
     info!("Station detected! Waiting 2s for network stability...");
     Timer::after(Duration::from_secs(2)).await;
 
     loop {
+        debug!("received from VIDEO CHANNEL");
         match VIDEO_CHANNEL.receive().await {
             CameraMessage::VideoChunk(buffer, length) => {
                 if current_pos + length <= frame_buffer.len() {
@@ -525,9 +530,10 @@ async fn udp_task(
                         .copy_from_slice(&buffer.0[..length]);
                     current_pos += length;
                 } else {
-                    println!("JPEG frame is too big for buffer {}", frame_buffer.len());
+                    info!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
-
+                debug!("sending pool buffer over VIDEO_DATA_POOL");
+                VIDEO_DATA_POOL.send(buffer).await;
             }
             CameraMessage::EndOfFrame => {
                 if current_pos == 0 {
@@ -569,5 +575,4 @@ async fn udp_task(
             }
         }
     }
-
 }
