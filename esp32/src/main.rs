@@ -15,18 +15,19 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 use camera_tcp_server::camera::cam_init;
-use log::{debug, info, trace};
 use core::ops::Index;
+use log::{debug, info, trace};
 // use edge_dhcp::io::server;
 
 use embassy_executor::Spawner;
 
-use core::{net::{Ipv4Addr,SocketAddrV4}, str::FromStr};
+use core::{
+    net::{Ipv4Addr, SocketAddrV4},
+    str::FromStr,
+};
 use embassy_futures::yield_now;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{
-    IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4,
-};
+use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer, with_timeout};
@@ -292,9 +293,7 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(100)).await
     }
 
-    stack
-        .config_v4()
-        .inspect(|c| info!("ipv4 config: {c:?}"));
+    stack.config_v4().inspect(|c| info!("ipv4 config: {c:?}"));
 
     let stats: HeapStats = esp_alloc::HEAP.stats();
     // HeapStats implements the Display and defmt::Format traits, so you can
@@ -333,9 +332,6 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
 
     let mut dhcp_server: Server<_, 64> = Server::new(|| embassy_time::Instant::now().as_secs(), ip);
 
-    STATION_CONNECTED.wait().await;
-    STATION_CONNECTED.reset();
-
     loop {
         // io::server::run never returns, so we wrap it into timeout to be
         // able to get leased addresses and get our IP of the client
@@ -356,14 +352,14 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
                 // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
                 // just assume static client with this IP
                 LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
-                info!("DHCP {e:?}");
+                // debug!("DHCP {e:?}");
             }
             _ => {}
         }
 
         // stream to the last one connected
         for (client_ip, _) in dhcp_server.leases.iter() {
-            info!("Leased IP addr: {}", client_ip);
+            // debug!("Leased IP addr: {}", client_ip);
             LAST_CONNECTED_IP.signal(*client_ip);
         }
     }
@@ -438,7 +434,6 @@ async fn camera_task(camera: Camera<'static>) {
                         .send(CameraMessage::VideoChunk(scratch_buf, chunk.len()))
                         .await;
                 }
-
                 (data.len(), ends_with_eof, transfer.is_done())
             }
         };
@@ -484,13 +479,7 @@ async fn udp_task(
     tx_payload: &'static mut [u8; 32768],
 ) {
     info!("Start UDP task...");
-    let mut socket = UdpSocket::new(
-        stack,
-        rx_meta,
-        rx_payload,
-        tx_meta,
-        tx_payload,
-    );
+    let mut socket = UdpSocket::new(stack, rx_meta, rx_payload, tx_meta, tx_payload);
     socket.bind(DEFAULT_PORT_ENV).unwrap();
 
     let mut frame_id: u16 = 0;
@@ -504,7 +493,7 @@ async fn udp_task(
     info!("UDP task waiting for a station to connect...");
     STATION_CONNECTED.wait().await;
     STATION_CONNECTED.reset();
-    
+
     // Give the station a moment to initialize its network interface after connecting
     info!("Station detected! Waiting 2s for network stability...");
     Timer::after(Duration::from_secs(2)).await;
@@ -519,7 +508,7 @@ async fn udp_task(
                 } else {
                     info!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
-
+                VIDEO_DATA_POOL.send(buffer).await;
             }
             CameraMessage::EndOfFrame => {
                 if current_pos == 0 {
@@ -561,5 +550,4 @@ async fn udp_task(
             }
         }
     }
-
 }
