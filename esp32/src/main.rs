@@ -13,6 +13,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::rc::Rc;
 
 use camera_tcp_server::camera::cam_init;
 use core::ops::Index;
@@ -102,13 +103,13 @@ include!(concat!(env!("OUT_DIR"), "/port.rs"));
 const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 const DEFAULT_GW_IP_ADDR: &str = "192.168.2.1";
 const AP_SSID_NAME: &str = "esp-radio-2";
-const MAX_FRAME_SIZE: usize = 32768;
-const DATA_CHUNK_SIZE: usize = 1024;
+const MAX_FRAME_SIZE: usize = 65_536; // 64KB is max JPEG size, but we need some extra space for metadata and headers
+const DATA_CHUNK_SIZE: usize = 1400;
 const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
 // both need SRAM but DMA must be static
 const HEAP_SIZE: usize = 100 * 1024 - DMA_RX_STREAM_BUF_SIZE;
 const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
-const VIDEO_DATA_POOL_POOL_SIZE: usize = 16;
+const VIDEO_DATA_POOL_POOL_SIZE: usize = 32;
 const CAMERA_STACK_SIZE: usize = 2048;
 const MTU: usize = 1500;
 pub enum CameraMessage {
@@ -151,7 +152,7 @@ static LAST_CONNECTED_IP: Signal<CriticalSectionRawMutex, Ipv4Addr> = Signal::ne
 async fn main(spawner: Spawner) -> ! {
     // TODO :why?
     // DEBUG - failed to transmit IP: device exhausted
-    esp_println::logger::init_logger(log::LevelFilter::Debug);
+    esp_println::logger::init_logger(log::LevelFilter::Info);
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     // all peripherals are `generated` at compile time as singletons
     // peripherals.WIFI
@@ -185,6 +186,8 @@ async fn main(spawner: Spawner) -> ! {
         ControllerConfig::default().with_initial_config(access_point_config),
     )
     .expect("Failed to initialize WiFi");
+
+    let owned_controller = Rc::new(controller);
 
     info!("Wifi started!");
 
@@ -256,13 +259,14 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
-    spawner.spawn(connection(controller).expect("Failed to spawn wifi controller."));
+    spawner.spawn(connection(Rc::clone(&owned_controller)).expect("Failed to spawn wifi controller."));
+    spawner.spawn(rssi_task(Rc::clone(&owned_controller)).expect("Failed to spawn RSSI task."));
     // advances network stack
     spawner.spawn(net_task(runner).expect("Failed to spawn network task."));
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).expect("Failed to spawn dhcp."));
 
     // Optimized buffers for SVGA streaming
-    let udp_frame_buffer = mk_static!([u8; 32786], [0u8; 32786]);
+    let udp_frame_buffer = mk_static!([u8; DMA_RX_STREAM_BUF_SIZE], [0u8; DMA_RX_STREAM_BUF_SIZE]);
     let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
     let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
     let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
@@ -331,12 +335,12 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
         .expect("Failed to create socket for dhcp.");
 
     let mut dhcp_server: Server<_, 64> = Server::new(|| embassy_time::Instant::now().as_secs(), ip);
-
+    let mut timeout_seconds = 10;
     loop {
         // io::server::run never returns, so we wrap it into timeout to be
         // able to get leased addresses and get our IP of the client
         let result = with_timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(timeout_seconds),
             io::server::run(
                 &mut dhcp_server,
                 &ServerOptions::new(ip, Some(&mut gw_buf)),
@@ -362,11 +366,28 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
             // debug!("Leased IP addr: {}", client_ip);
             LAST_CONNECTED_IP.signal(*client_ip);
         }
+        timeout_seconds = 600;
     }
 }
 
 #[embassy_executor::task]
-async fn connection(controller: WifiController<'static>) {
+async fn rssi_task(controller: Rc<WifiController<'static>>) {
+    loop {
+        match controller.rssi(){
+            Ok(rssi) => {
+                // info!("Current RSSI: {} dBm", rssi);
+
+            },
+            Err(e) => {
+                // debug!("RSSI error : {e}");
+            }
+        }
+        Timer::after(Duration::from_secs(5)).await
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(controller: Rc<WifiController<'static>>) {
     info!("start connection task");
     loop {
         let ev = controller
@@ -425,11 +446,13 @@ async fn camera_task(camera: Camera<'static>) {
             } else {
                 for chunk in data.chunks(DATA_CHUNK_SIZE) {
                     let mut scratch_buf = VIDEO_DATA_POOL.receive().await;
+                    debug!("got chunk of data pool");
                     scratch_buf.0[..chunk.len()].copy_from_slice(chunk);
 
                     // Use .send(...).await to provide backpressure and ensure frame integrity.
                     // This prevents the task from busy-looping when the network is congested
                     // and ensures the browser doesn't receive partial/corrupted JPEGs.
+                    debug!("sending data vin VIDEO_CHANNEL");
                     VIDEO_CHANNEL
                         .send(CameraMessage::VideoChunk(scratch_buf, chunk.len()))
                         .await;
@@ -499,6 +522,7 @@ async fn udp_task(
     Timer::after(Duration::from_secs(2)).await;
 
     loop {
+        debug!("received from VIDEO CHANNEL");
         match VIDEO_CHANNEL.receive().await {
             CameraMessage::VideoChunk(buffer, length) => {
                 if current_pos + length <= frame_buffer.len() {
@@ -508,6 +532,7 @@ async fn udp_task(
                 } else {
                     info!("JPEG frame is too big for buffer {}", frame_buffer.len());
                 }
+                debug!("sending pool buffer over VIDEO_DATA_POOL");
                 VIDEO_DATA_POOL.send(buffer).await;
             }
             CameraMessage::EndOfFrame => {
