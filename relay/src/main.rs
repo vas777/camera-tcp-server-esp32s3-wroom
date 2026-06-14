@@ -15,10 +15,10 @@ use tokio::sync::broadcast;
 async fn main() -> color_eyre::Result<()> {
     // Create a broadcast channel for reassembled JPEG frames.
     // We use a buffer of 16 frames; slow clients will be dropped if they lag too far.
-    let (tx, _) = broadcast::channel::<Vec<u8>>(32);
-    let (tx2, _) = broadcast::channel::<Vec<u8>>(32);
-    let udp_tx = tx.clone();
-    let udp_tx2 = tx2.clone();
+    let (tx, _) = broadcast::channel::<Vec<u8>>(16536);
+    let (tx2, _) = broadcast::channel::<Vec<u8>>(16536);
+    let udp_to_image_tx = tx.clone();
+    let image_to_tcp = tx2.clone();
 
     let mut detector = ScrfdDetector::from_hf().build().await?;
 
@@ -96,7 +96,7 @@ async fn main() -> color_eyre::Result<()> {
                     // );
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // Broadcast the complete frame to all connected browsers
-                    let _ = udp_tx.send(full_image);
+                    let _ = udp_to_image_tx.send(full_image);
 
                     pending_frames.remove(&chunk.frame_id);
                 }
@@ -105,10 +105,11 @@ async fn main() -> color_eyre::Result<()> {
     });
 
     
-    let mut rx = tx.subscribe();
+    let mut from_udp = tx.subscribe();
+
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
+            match from_udp.recv().await {
                 Ok(frame) => {
                     let mut image = image::DynamicImage::from(image::load_from_memory(&frame).unwrap());
 
@@ -121,6 +122,7 @@ async fn main() -> color_eyre::Result<()> {
                             (
                                 b.bbox.x1 as i32,
                                 b.bbox.y1 as i32,
+                                // height and width of bounding box
                                 (b.bbox.x2 as i32 - b.bbox.x1 as i32) as u32,
                                 (b.bbox.y2 as i32 - b.bbox.y1 as i32) as u32,
                             )
@@ -139,8 +141,8 @@ async fn main() -> color_eyre::Result<()> {
                             .is_ok()
                         {
                             // Only send if there is at least one subscriber
-                            if udp_tx.receiver_count() > 0 {
-                                let _ = udp_tx.send(jpeg_data);
+                            if image_to_tcp.receiver_count() > 0 {
+                                let _ = image_to_tcp.send(jpeg_data);
                                 println!("Sent JPEG frame to channel");
                             }
                         }
@@ -166,8 +168,8 @@ async fn main() -> color_eyre::Result<()> {
                         .is_ok()
                     {
                         // Only send if there is at least one subscriber
-                        if udp_tx2.receiver_count() > 0 {
-                            let _ = udp_tx2.send(jpeg_data);
+                        if image_to_tcp.receiver_count() > 0 {
+                            let _ = image_to_tcp.send(jpeg_data);
                             println!("Sent JPEG frame to channel");
                         }
                     }
@@ -207,6 +209,14 @@ async fn main() -> color_eyre::Result<()> {
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
+                        // Optional: Drain the channel to ensure we are sending the freshest frame
+                        // This prevents building up a "backlog" of old frames in the pipe.
+                        let mut latest_frame = frame;
+                        while let Ok(newer_frame) = rx.try_recv() {
+                            latest_frame = newer_frame;
+                        }
+                        let frame = latest_frame;
+
                         println!("Sending frame of size {} bytes to browser", frame.len());
                         let frame_header = format!(
                             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",

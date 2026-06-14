@@ -355,7 +355,7 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
             Err(e) => {
                 // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
                 // just assume static client with this IP
-                LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
+                // LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
                 // debug!("DHCP {e:?}");
             }
             _ => {}
