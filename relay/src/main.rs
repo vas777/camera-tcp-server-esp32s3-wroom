@@ -8,7 +8,6 @@ use tokio::time;
 use std::sync::atomic::AtomicI32;
 use log::{debug, info};
 use simple_logger::SimpleLogger;
-use std::io::Write;
 
 #[tokio::main]
 async fn main() {

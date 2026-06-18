@@ -12,13 +12,19 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::rc::Rc;
+use alloc::vec;
 
 use camera_tcp_server::camera::cam_init;
-use core::ops::Index;
-use log::{debug, info, trace};
-// use edge_dhcp::io::server;
+use camera_tcp_server::{
+    AP_SSID_NAME, CAMERA_STACK_SIZE, DATA_CHUNK_SIZE, DEFAULT_GW_IP_ADDR, DMA_RX_STREAM_BUF_SIZE,
+    GW_IP_ADDR_ENV, HEAP_SIZE, RECLAIMED_HEAP_SIZE, UDP_RX_BUFFER_SIZE, UDP_RX_NUM_OF_PACKET_PER_BUFFER, UDP_TX_BUFFER_SIZE,
+    UDP_TX_NUM_OF_PACKET_PER_BUFFER, VIDEO_DATA_POOL_POOL_SIZE,
+};
+
+include!(concat!(env!("OUT_DIR"), "/port.rs"));
+
+use log::{debug, info};
 
 use embassy_executor::Spawner;
 
@@ -70,48 +76,6 @@ macro_rules! mk_static {
     }};
 }
 
-// TODO: decide either this parsing or build.rs
-// const fn parse_u16(s: &str) -> u16 {
-//     let mut res: u16 = 0;
-//     let mut i = 0;
-//     let bytes = s.as_bytes();
-//     while i < bytes.len() {
-//         assert!(bytes[i] >= b'0' && bytes[i] <= b'9', "Error: Invalid port");
-//         let digit = (bytes[i] - b'0') as u16;
-
-//         let multiplied = match res.checked_mul(10) {
-//             Some(v) => v,
-//             None => panic!("Error: Port value exceeds u16::MAX (65535)"),
-//         };
-
-//         res = match multiplied.checked_add(digit) {
-//             Some(v) => v,
-//             None => panic!("Error: Port value exceeds u16::MAX (65535)"),
-//         };
-//         i += 1;
-//     }
-//     res
-// }
-
-// const DEFAULT_PORT_ENV: u16 = match option_env!("DEFAULT_PORT") {
-//     Some(p) => parse_u16(p),
-//     None => DEFAULT_PORT,
-// };
-
-// TODO: adjust numbers
-include!(concat!(env!("OUT_DIR"), "/port.rs"));
-const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
-const DEFAULT_GW_IP_ADDR: &str = "192.168.2.1";
-const AP_SSID_NAME: &str = "esp-radio-2";
-const MAX_FRAME_SIZE: usize = 65_536; // 64KB is max JPEG size, but we need some extra space for metadata and headers
-const DATA_CHUNK_SIZE: usize = 1400;
-const TX_BUFF_NUMBER_CHUNKS: usize = MAX_FRAME_SIZE / DATA_CHUNK_SIZE;
-// both need SRAM but DMA must be static
-const HEAP_SIZE: usize = 100 * 1024 - DMA_RX_STREAM_BUF_SIZE;
-const DMA_RX_STREAM_BUF_SIZE: usize = TX_BUFF_NUMBER_CHUNKS * DATA_CHUNK_SIZE;
-const VIDEO_DATA_POOL_POOL_SIZE: usize = 32;
-const CAMERA_STACK_SIZE: usize = 2048;
-const MTU: usize = 1500;
 pub enum CameraMessage {
     /// A chunk of video data. Contains the buffer and the number of valid bytes.
     VideoChunk(MyBox<[u8; DATA_CHUNK_SIZE]>, usize),
@@ -160,7 +124,7 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     // - `reclaimed`: Memory reclaimed from the esp-idf bootloader.
-    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: RECLAIMED_HEAP_SIZE );
     esp_alloc::heap_allocator!(size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -246,6 +210,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     let app_core_stack = mk_static!(ProcStack<CAMERA_STACK_SIZE>, ProcStack::new());
+
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
         sw_int.software_interrupt1,
@@ -259,18 +224,24 @@ async fn main(spawner: Spawner) -> ! {
         },
     );
 
-    spawner.spawn(connection(Rc::clone(&owned_controller)).expect("Failed to spawn wifi controller."));
-    spawner.spawn(rssi_task(Rc::clone(&owned_controller)).expect("Failed to spawn RSSI task."));
+    spawner
+        .spawn(connection(Rc::clone(&owned_controller)).expect("Failed to spawn wifi controller."));
     // advances network stack
     spawner.spawn(net_task(runner).expect("Failed to spawn network task."));
     spawner.spawn(run_dhcp(stack, gw_ip_addr_str).expect("Failed to spawn dhcp."));
 
     // Optimized buffers for SVGA streaming
     let udp_frame_buffer = mk_static!([u8; DMA_RX_STREAM_BUF_SIZE], [0u8; DMA_RX_STREAM_BUF_SIZE]);
-    let udp_rx_meta = mk_static!([PacketMetadata; 4], [PacketMetadata::EMPTY; 4]);
-    let udp_rx_payload = mk_static!([u8; 1024], [0u8; 1024]);
-    let udp_tx_meta = mk_static!([PacketMetadata; 20], [PacketMetadata::EMPTY; 20]);
-    let udp_tx_payload = mk_static!([u8; 32768], [0u8; 32768]);
+    let udp_rx_meta = mk_static!(
+        [PacketMetadata; UDP_RX_NUM_OF_PACKET_PER_BUFFER],
+        [PacketMetadata::EMPTY; UDP_RX_NUM_OF_PACKET_PER_BUFFER]
+    );
+    let udp_rx_payload = mk_static!([u8; UDP_RX_BUFFER_SIZE], [0u8; UDP_RX_BUFFER_SIZE]);
+    let udp_tx_meta = mk_static!(
+        [PacketMetadata; UDP_TX_NUM_OF_PACKET_PER_BUFFER],
+        [PacketMetadata::EMPTY; UDP_TX_NUM_OF_PACKET_PER_BUFFER]
+    );
+    let udp_tx_payload = mk_static!([u8; UDP_TX_BUFFER_SIZE], [0u8; UDP_TX_BUFFER_SIZE]);
 
     spawner.spawn(
         udp_task(
@@ -300,8 +271,6 @@ async fn main(spawner: Spawner) -> ! {
     stack.config_v4().inspect(|c| info!("ipv4 config: {c:?}"));
 
     let stats: HeapStats = esp_alloc::HEAP.stats();
-    // HeapStats implements the Display and defmt::Format traits, so you can
-    // pretty-print the heap stats.
     info!("{}", stats);
 
     loop {
@@ -367,22 +336,6 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
             LAST_CONNECTED_IP.signal(*client_ip);
         }
         timeout_seconds = 600;
-    }
-}
-
-#[embassy_executor::task]
-async fn rssi_task(controller: Rc<WifiController<'static>>) {
-    loop {
-        match controller.rssi(){
-            Ok(rssi) => {
-                // info!("Current RSSI: {} dBm", rssi);
-
-            },
-            Err(e) => {
-                // debug!("RSSI error : {e}");
-            }
-        }
-        Timer::after(Duration::from_secs(5)).await
     }
 }
 
@@ -496,10 +449,10 @@ async fn camera_task(camera: Camera<'static>) {
 async fn udp_task(
     stack: Stack<'static>,
     frame_buffer: &'static mut [u8],
-    rx_meta: &'static mut [PacketMetadata; 4],
-    rx_payload: &'static mut [u8; 1024],
-    tx_meta: &'static mut [PacketMetadata; 20],
-    tx_payload: &'static mut [u8; 32768],
+    rx_meta: &'static mut [PacketMetadata; UDP_RX_NUM_OF_PACKET_PER_BUFFER],
+    rx_payload: &'static mut [u8; UDP_RX_BUFFER_SIZE],
+    tx_meta: &'static mut [PacketMetadata; UDP_TX_NUM_OF_PACKET_PER_BUFFER],
+    tx_payload: &'static mut [u8; UDP_TX_BUFFER_SIZE],
 ) {
     info!("Start UDP task...");
     let mut socket = UdpSocket::new(stack, rx_meta, rx_payload, tx_meta, tx_payload);
@@ -511,7 +464,8 @@ async fn udp_task(
     LAST_CONNECTED_IP.reset();
 
     info!("user ip {user_ip}");
-    let remote_endpoint = core::net::SocketAddr::V4(SocketAddrV4::new(user_ip, 5000));
+    let remote_endpoint =
+        core::net::SocketAddr::V4(SocketAddrV4::new(user_ip, DEFAULT_RELAY_PORT_ENV));
 
     info!("UDP task waiting for a station to connect...");
     STATION_CONNECTED.wait().await;
@@ -561,7 +515,7 @@ async fn udp_task(
                     }
 
                     if chunk_id == total_chunks - 1 {
-                        info!("Frame {} sent ({} bytes)", frame_id, current_pos);
+                        debug!("Frame {} sent ({} bytes)", frame_id, current_pos);
                     }
 
                     chunk_id += 1;
