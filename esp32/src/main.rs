@@ -18,8 +18,9 @@ use alloc::vec;
 use camera_tcp_server::camera::cam_init;
 use camera_tcp_server::{
     AP_SSID_NAME, CAMERA_STACK_SIZE, DATA_CHUNK_SIZE, DEFAULT_GW_IP_ADDR, DMA_RX_STREAM_BUF_SIZE,
-    GW_IP_ADDR_ENV, HEAP_SIZE, RECLAIMED_HEAP_SIZE, UDP_RX_BUFFER_SIZE, UDP_RX_NUM_OF_PACKET_PER_BUFFER, UDP_TX_BUFFER_SIZE,
-    UDP_TX_NUM_OF_PACKET_PER_BUFFER, VIDEO_DATA_POOL_POOL_SIZE,
+    GW_IP_ADDR_ENV, HEAP_SIZE, RECLAIMED_HEAP_SIZE, UDP_RX_BUFFER_SIZE,
+    UDP_RX_NUM_OF_PACKET_PER_BUFFER, UDP_TX_BUFFER_SIZE, UDP_TX_NUM_OF_PACKET_PER_BUFFER,
+    VIDEO_DATA_POOL_POOL_SIZE,
 };
 
 include!(concat!(env!("OUT_DIR"), "/port.rs"));
@@ -244,7 +245,7 @@ async fn main(spawner: Spawner) -> ! {
     let udp_tx_payload = mk_static!([u8; UDP_TX_BUFFER_SIZE], [0u8; UDP_TX_BUFFER_SIZE]);
 
     spawner.spawn(
-        udp_task(
+        stream_over_udp(
             stack,
             udp_frame_buffer,
             udp_rx_meta,
@@ -262,8 +263,7 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    info!("UDP Relay Stream active. Sending JpegFrameChunks to 192.168.2.2:{DEFAULT_PORT_ENV}");
-    info!("DHCP is enabled so there's no need to configure a static IP, just in case:");
+    info!("UDP Relay Stream active. Sending JpegFrameChunks to port: {DEFAULT_PORT_ENV}");
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
@@ -446,7 +446,7 @@ async fn camera_task(camera: Camera<'static>) {
 }
 
 #[embassy_executor::task]
-async fn udp_task(
+async fn stream_over_udp(
     stack: Stack<'static>,
     frame_buffer: &'static mut [u8],
     rx_meta: &'static mut [PacketMetadata; UDP_RX_NUM_OF_PACKET_PER_BUFFER],
