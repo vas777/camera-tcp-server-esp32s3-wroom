@@ -4,9 +4,13 @@ name         = "camera_tcp_server"
 rust-version = "1.88"
 version      = "0.1.0"
 
+[lib]
+name = "camera_tcp_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "camera_tcp_server"
-path = "./src/main.rs"
+path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" } 
