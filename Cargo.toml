@@ -1,7 +1,0 @@
-[workspace]
-members = [
-    "esp32",
-    "relay",
-    "shared",
-]
-resolver = "2"
