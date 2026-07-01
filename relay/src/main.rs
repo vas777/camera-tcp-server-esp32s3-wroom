@@ -1,23 +1,26 @@
+use log::{debug, info};
+use shared::{JpegFrameChunk, STRUCT_CHUNK_SIZE};
+use simple_logger::SimpleLogger;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast;
-use shared::{JpegFrameChunk, STRUCT_CHUNK_SIZE};
 use tokio::time;
-use std::sync::atomic::AtomicI32;
-use log::{debug, info};
-use simple_logger::SimpleLogger;
 
 #[tokio::main]
 async fn main() {
     // Create a broadcast channel for reassembled JPEG frames.
     // We use a buffer of 16 frames; slow clients will be dropped if they lag too far.
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
 
     let (tx, _) = broadcast::channel::<Vec<u8>>(16);
     let udp_tx = tx.clone();
-    
+
     let counter = Arc::new(AtomicI32::new(0));
     let frames = counter.clone();
 
@@ -26,9 +29,8 @@ async fn main() {
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let fps = counter.swap(0,std::sync::atomic::Ordering::Relaxed );
+            let fps = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
             info!("FPS {}", fps);
-            
         }
     });
 
@@ -36,7 +38,7 @@ async fn main() {
         let socket = UdpSocket::bind("0.0.0.0:5000")
             .await
             .expect("Failed to bind UDP socket");
-            info!("Relay listening for UDP chunks on 0.0.0.0:5000...");
+        info!("Relay listening for UDP chunks on 0.0.0.0:5000...");
 
         let mut buf = [0u8; STRUCT_CHUNK_SIZE];
         let mut pending_frames: HashMap<u16, Vec<Option<Vec<u8>>>> = HashMap::new();
@@ -46,7 +48,7 @@ async fn main() {
                 .recv_from(&mut buf)
                 .await
                 .expect("Failed to receive UDP packet");
-                debug!("DEBUG: Received {} bytes from {}", nbytes, src);
+            debug!("DEBUG: Received {} bytes from {}", nbytes, src);
 
             if let Some(chunk) = JpegFrameChunk::from_bytes(&buf[..nbytes]) {
                 if pending_frames.len() > 10 {
@@ -115,7 +117,9 @@ async fn main() {
                           Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\
                           Cache-Control: no-cache\r\n\
                           Connection: close\r\n\r\n";
-            if socket.write_all(header.as_bytes()).await.is_err() { return; }
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
 
             loop {
                 match rx.recv().await {
@@ -124,9 +128,15 @@ async fn main() {
                             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
                             frame.len()
                         );
-                        if socket.write_all(frame_header.as_bytes()).await.is_err() { break; }
-                        if socket.write_all(&frame).await.is_err() { break; }
-                        if socket.write_all(b"\r\n").await.is_err() { break; }
+                        if socket.write_all(frame_header.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if socket.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                        if socket.write_all(b"\r\n").await.is_err() {
+                            break;
+                        }
                     }
                     // Handle case where browser is too slow and skips frames
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,

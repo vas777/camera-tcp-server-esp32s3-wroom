@@ -3,7 +3,7 @@
 pub const MAX_CHUNK_SIZE: usize = 1400;
 pub const STRUCT_CHUNK_SIZE: usize = MAX_CHUNK_SIZE + 6;
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct JpegFrameChunk {
     pub frame_id: u16,
     pub chunk_id: u8,
@@ -23,7 +23,7 @@ impl JpegFrameChunk {
         res[6..STRUCT_CHUNK_SIZE].copy_from_slice(&self.payload);
         res
     }
-    
+
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < STRUCT_CHUNK_SIZE {
@@ -43,10 +43,9 @@ impl JpegFrameChunk {
 #[cfg(test)]
 mod tests {
     use crate::{JpegFrameChunk, MAX_CHUNK_SIZE};
-    // TODO add more comprehensive  testing 
+    // TODO add more comprehensive  testing
     // use quickcheck::*;
     // use rand::*;
-
 
     // #[derive(Debug, Clone)]
     // struct ValidPasswordFixture(pub JpegFrameChunk);
@@ -60,7 +59,6 @@ mod tests {
     //     }
     // }
 
-
     // #[test]
     // fn valid_passwords_are_parsed_successfully() {
     //     fn property(valid_password: ValidPasswordFixture) -> bool {
@@ -73,25 +71,25 @@ mod tests {
     //         .quickcheck(property as fn(ValidPasswordFixture) -> bool);
     // }
 
-#[test]
-fn test_jpeg_fram_chunk() {
-    // TODO : try quickcheck ?
-    let frame1 = JpegFrameChunk {
-        frame_id: 255,
-        chunk_id: 254,
-        total_chunks: 254,
-        payload_len: MAX_CHUNK_SIZE as u16,
-        payload: [1u8; MAX_CHUNK_SIZE],
-    };
+    #[test]
+    fn test_jpeg_fram_chunk() {
+        // TODO : try quickcheck ?
+        let frame1 = JpegFrameChunk {
+            frame_id: 255,
+            chunk_id: 254,
+            total_chunks: 254,
+            payload_len: MAX_CHUNK_SIZE as u16,
+            payload: [1u8; MAX_CHUNK_SIZE],
+        };
 
-    let frame_bytes = frame1.to_bytes();
+        let frame_bytes = frame1.to_bytes();
 
-    let frame_from_bytes = JpegFrameChunk::from_bytes(&frame_bytes).unwrap();
+        let frame_from_bytes = JpegFrameChunk::from_bytes(&frame_bytes).unwrap();
 
-    assert_eq!(frame1.frame_id, frame_from_bytes.frame_id);
-    assert_eq!(frame1.chunk_id, frame_from_bytes.chunk_id);
-    assert_eq!(frame1.total_chunks, frame_from_bytes.total_chunks);
-    assert_eq!(frame1.payload_len, frame_from_bytes.payload_len);
-    assert_eq!(frame1.payload, frame_from_bytes.payload);
-}
+        assert_eq!(frame1.frame_id, frame_from_bytes.frame_id);
+        assert_eq!(frame1.chunk_id, frame_from_bytes.chunk_id);
+        assert_eq!(frame1.total_chunks, frame_from_bytes.total_chunks);
+        assert_eq!(frame1.payload_len, frame_from_bytes.payload_len);
+        assert_eq!(frame1.payload, frame_from_bytes.payload);
+    }
 }
