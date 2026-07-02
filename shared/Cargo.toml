@@ -1,0 +1,14 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+quickcheck = "1.1.0"
+rand = "0.10.1"

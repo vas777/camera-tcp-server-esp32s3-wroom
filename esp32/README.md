@@ -40,3 +40,13 @@ Main ones are:
 - [ ] Try adding microphone.
 - [ ] In addition to USB, also transmit live to the `internet` (basically a stress test of chip?).
 - [ ] Try adding face recognition functionality.
+
+# Try UDP with relay
+
+ESP32 -> Jpeg Frames/UDP -> relay <-> WebSocket/TCP OR webRTC/UDP -> Browser
+
+1. Read full jpeg frame from camera
+2. Calculate total_chunks
+3. Send individual chunks like JpegFrameChunk to relay
+4. Relay assembles frame if possible (missing chunks are discarded)
+3. Relay for now uses embedded HTML to serve video stream

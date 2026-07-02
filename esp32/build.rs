@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fs::OpenOptions, io::Write, path::Path};
 
 fn main() {
     linker_be_nice();
@@ -6,19 +6,29 @@ fn main() {
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
     println!("cargo:rerun-if-env-changed=DEFAULT_PORT");
+    println!("cargo:rerun-if-env-changed=DEFAULT_RELAY_PORT");
 }
 
 fn read_env() {
     use std::str::FromStr;
-    let p = std::env::var("DEFAULT_PORT").unwrap_or("8080".to_owned());
-    let port = u16::from_str(&p).unwrap();
     let out_dir = std::env::var("OUT_DIR").unwrap();
+    let mut default_env_vars = Vec::new();
+    default_env_vars.push(("DEFAULT_PORT", "8080"));
+    default_env_vars.push(("DEFAULT_RELAY_PORT", "5000"));
+
     let port_rs = Path::new(&out_dir).join("port.rs");
-    std::fs::write(
-        port_rs,
-        format!("pub const DEFAULT_PORT_ENV: u16 = {};", port),
-    )
-    .unwrap();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(port_rs)
+        .unwrap();
+
+    for (env, default) in default_env_vars {
+        let p = std::env::var(env).unwrap_or(default.to_owned());
+        let port = u16::from_str(&p).unwrap();
+        file.write(format!("pub const {}_ENV: u16 = {};", env, port).as_bytes())
+            .unwrap();
+    }
 }
 
 fn linker_be_nice() {
