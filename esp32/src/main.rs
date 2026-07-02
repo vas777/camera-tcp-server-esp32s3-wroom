@@ -35,7 +35,7 @@ use core::{
 };
 use embassy_futures::yield_now;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
+use embassy_net::{Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::{channel::Channel, signal::Signal};
 use embassy_time::{Duration, Timer, with_timeout};
@@ -324,7 +324,7 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
             Err(e) => {
                 // TimeoutError but someone connected (STATION_CONNECTED) but no DHCP request
                 // just assume static client with this IP
-                LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
+                // LAST_CONNECTED_IP.signal(Ipv4Addr::new(192, 168, 2, 2));
                 // debug!("DHCP {e:?}");
             }
             _ => {}

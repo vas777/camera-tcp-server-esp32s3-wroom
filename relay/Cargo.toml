@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+color-eyre = "0.6.5"
+face_id = { version = "0.4.1"}
+image = "0.25.10"
+imageproc = "0.27.0"
+ort = "2.0.0-rc.12"
 log = "0.4.32"
 shared = { path = "../shared", features = ["std"] }
 simple_logger = "5.2.0"
