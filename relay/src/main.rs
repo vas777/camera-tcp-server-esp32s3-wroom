@@ -4,12 +4,12 @@ use shared::{JpegFrameChunk, STRUCT_CHUNK_SIZE};
 use simple_logger::SimpleLogger;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicI32;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::time;
-
 mod face;
 use crate::face::face_detection;
 
@@ -136,12 +136,12 @@ async fn main() {
         .init()
         .unwrap();
 
-    let (upd_image_tx, _) = broadcast::channel::<Vec<u8>>(16536);
-    let (image_tcp_tx, _) = broadcast::channel::<Vec<u8>>(16536);
+    let (upd_image_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let (image_tcp_tx, _) = broadcast::channel::<Vec<u8>>(256);
     let udp_to_image_tx = upd_image_tx.clone();
     let image_to_tcp = image_tcp_tx.clone();
 
-    let detector = ScrfdDetector::from_hf().build().await.unwrap();
+    let detector = Arc::new(Mutex::new(ScrfdDetector::from_hf().build().await.unwrap()));
 
     let counter = Arc::new(AtomicI32::new(0));
     let frames = counter.clone();
