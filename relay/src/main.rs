@@ -1,13 +1,17 @@
+use face_id::detector::ScrfdDetector;
 use log::{debug, info};
 use shared::{JpegFrameChunk, STRUCT_CHUNK_SIZE};
 use simple_logger::SimpleLogger;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicI32;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tokio::time;
+mod face;
+use crate::face::face_detection;
 
 async fn fps(counter: Arc<AtomicI32>) {
     let mut interval = time::interval(time::Duration::from_secs(1));
@@ -81,7 +85,7 @@ async fn udp_receiver(udp_tx: broadcast::Sender<Vec<u8>>, frames: Arc<AtomicI32>
 
                 frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                // Broadcast the complete frame to all connected browsers
+                // Send it to image processing
                 let _ = udp_tx.send(full_image);
 
                 pending_frames.remove(&chunk.frame_id);
@@ -132,13 +136,22 @@ async fn main() {
         .init()
         .unwrap();
 
-    let (tx, _) = broadcast::channel::<Vec<u8>>(16);
-    let udp_tx = tx.clone();
+    let (upd_image_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let (image_tcp_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let udp_to_image_tx = upd_image_tx.clone();
+    let image_to_tcp = image_tcp_tx.clone();
+
+    let detector = Arc::new(Mutex::new(ScrfdDetector::from_hf().build().await.unwrap()));
+
     let counter = Arc::new(AtomicI32::new(0));
     let frames = counter.clone();
 
     tokio::spawn(fps(counter));
-    tokio::spawn(udp_receiver(udp_tx, frames));
+    tokio::spawn(udp_receiver(udp_to_image_tx, frames));
+
+    let from_udp = upd_image_tx.subscribe();
+
+    tokio::spawn(face_detection(detector, from_udp, image_to_tcp));
 
     let listener = TcpListener::bind("0.0.0.0:8081")
         .await
@@ -146,7 +159,7 @@ async fn main() {
     info!("Browser stream available at http://localhost:8081");
 
     while let Ok((socket, _)) = listener.accept().await {
-        let rx = tx.subscribe();
+        let rx = image_tcp_tx.subscribe();
         tokio::spawn(tcp_broadcast(socket, rx));
     }
 }
